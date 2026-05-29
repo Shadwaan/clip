@@ -41,7 +41,7 @@ See [`PRD.md`](./PRD.md) for the full product spec and [`BUILD_LOG.md`](./BUILD_
 
 ## Quickstart (Windows + Modal backend)
 
-Tested on Windows 11 + PowerShell. Linux/macOS works the same way; substitute the Memurai install for `redis-server` from your package manager.
+Tested on Windows 11 + PowerShell. Linux/macOS works the same way — see [§ Running on macOS / Linux](#running-on-macos--linux) below for the equivalent commands.
 
 ### Prerequisites
 
@@ -103,6 +103,26 @@ Or just open `index.html` in a browser, paste a URL, click Describe.
 ```powershell
 Stop-Process -Id (Get-Content uvicorn.pid)
 ```
+
+Because uvicorn was started via `Start-Process` with stderr redirected to `uvicorn.err.log`, it runs detached from any terminal. Closing PowerShell, locking the screen, or Ctrl+C in another window won't kill it. The only things that stop it are the `Stop-Process` line above, a Windows reboot, or the Python process crashing.
+
+## Running on macOS / Linux
+
+The application code is fully cross-platform — only the *wrapper* (Redis install, daemonization, shell syntax) changes. Drop-in equivalents:
+
+| Step | Windows (PowerShell) | macOS / Linux (bash/zsh) |
+|---|---|---|
+| Redis | Memurai MSI → runs as service | macOS: `brew install redis && brew services start redis`<br/>Debian/Ubuntu: `sudo apt install redis-server` |
+| ffmpeg | OS installer | `brew install ffmpeg` / `sudo apt install ffmpeg` |
+| Virtualenv | `python -m venv .venv; .\.venv\Scripts\Activate.ps1` | `python3 -m venv .venv && source .venv/bin/activate` |
+| Env var | `$env:CLIP_BACKEND="modal"` | `export CLIP_BACKEND=modal` |
+| Detached uvicorn | `Start-Process uvicorn ... -RedirectStandardError uvicorn.err.log -PassThru \| ... \| Out-File uvicorn.pid` | `nohup uvicorn main:app --host 0.0.0.0 --port 8000 > uvicorn.err.log 2>&1 & echo $! > uvicorn.pid` |
+| Stop gateway | `Stop-Process -Id (Get-Content uvicorn.pid)` | `kill $(cat uvicorn.pid)` |
+| HTTP probe | `Invoke-RestMethod` / `curl.exe` | `curl` |
+
+Modal containers run on Modal's Linux infrastructure regardless of where the gateway client lives, so HF tokens, model caches, and GPU choice are unchanged. `modal setup` + `modal deploy modal_app.py` work identically on every OS.
+
+The default `CLIP_STORAGE_DIR` is `/tmp/clip-storage` — that's a real path on macOS/Linux and works as-is. On Windows it resolves to `C:\tmp\clip-storage`, which also works but is a bit odd; override `CLIP_STORAGE_DIR` if you'd rather not have a `\tmp` at drive root.
 
 ## API
 
