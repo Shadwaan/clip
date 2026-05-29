@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Tuple
 
-from constants import ModelChoice
+from constants import DEPLOYED_MODELS, ModelChoice
 from schemas import Event, Match, Scene
 
 PRECISION_KEYWORDS = (
@@ -30,12 +30,25 @@ def choose_model(
     query: Optional[str] = None,
 ) -> ModelChoice:
     if forced:
+        # Explicit user choice is honored as-is. If it names an undeployed
+        # model the endpoint surfaces a clear error (now CORS-visible) rather
+        # than silently downgrading something the caller specifically asked for.
         return ModelChoice(forced)
+
+    preferred = ModelChoice.MARLIN_2B
     if duration_sec > LONG_VIDEO_THRESHOLD_SEC:
-        return ModelChoice.TIMELENS_8B
-    if query and any(kw in query.lower() for kw in PRECISION_KEYWORDS):
-        return ModelChoice.TIMELENS_8B
-    return ModelChoice.MARLIN_2B
+        preferred = ModelChoice.TIMELENS_8B
+    elif query and any(kw in query.lower() for kw in PRECISION_KEYWORDS):
+        preferred = ModelChoice.TIMELENS_8B
+
+    # TimeLens-8B is the intended long-video / precision upgrade but is
+    # roadmap-only in v0.1. Until it's deployed, fall back to Marlin-2B —
+    # it has native temporal grounding via caption()/find(), so long videos
+    # still work instead of 500-ing. Once TimeLens lands in DEPLOYED_MODELS
+    # this routing starts using it automatically, no code change.
+    if preferred not in DEPLOYED_MODELS:
+        return ModelChoice.MARLIN_2B
+    return preferred
 
 
 # ---------- Output parsers ----------
