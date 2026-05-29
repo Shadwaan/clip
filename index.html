@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Clip — Video Analysis</title>
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --fg: #f5f5f5;
+    --muted: #888;
+    --accent: #7df0a8;
+    --card: #161616;
+    --border: #2a2a2a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Inter", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.5;
+  }
+  .container { max-width: 960px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin-bottom: 32px; font-size: 14px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  input[type="file"], input[type="text"], select, textarea {
+    background: #0e0e0e;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 10px 12px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 14px;
+    flex: 1;
+    min-width: 200px;
+  }
+  textarea { width: 100%; min-height: 60px; resize: vertical; }
+  button {
+    background: var(--accent);
+    color: #0a0a0a;
+    border: 0;
+    padding: 10px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+  video { width: 100%; border-radius: 6px; margin-top: 8px; background: #000; }
+  .timestamps {
+    display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px;
+  }
+  .ts-chip {
+    background: #1d1d1d;
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-family: ui-monospace, "SF Mono", monospace;
+    cursor: pointer;
+    color: var(--accent);
+  }
+  .ts-chip:hover { background: #252525; }
+  pre {
+    background: #0e0e0e;
+    border: 1px solid var(--border);
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 13px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .tab-row { display: flex; gap: 4px; margin-bottom: 12px; }
+  .tab {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-bottom: 0; padding: 8px 14px; border-radius: 6px 6px 0 0;
+    cursor: pointer; font-size: 13px;
+  }
+  .tab.active { background: var(--card); color: var(--fg); border-bottom: 1px solid var(--card); margin-bottom: -1px; position: relative; z-index: 1; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .status { color: var(--muted); font-size: 13px; font-family: ui-monospace, monospace; }
+  .err { color: #ff7070; }
+  .model-badge {
+    display: inline-block; background: #1d1d1d; border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 4px; font-size: 11px; color: var(--accent);
+    font-family: ui-monospace, monospace;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Clip 🎬</h1>
+  <div class="sub">Ask questions of any video · Marlin-2B + TimeLens-8B</div>
+
+  <div class="card">
+    <div class="tab-row" id="source-tabs">
+      <button class="tab active" data-src="upload">Upload file</button>
+      <button class="tab" data-src="url">From URL (YouTube / link)</button>
+    </div>
+
+    <div class="tab-panel active" data-src="upload">
+      <div class="row">
+        <input type="file" id="file" accept="video/*" />
+        <button id="upload-btn" onclick="upload()">Upload</button>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-src="url">
+      <div class="row">
+        <input type="text" id="url" placeholder="https://youtube.com/watch?v=... or any .mp4 URL" />
+        <button onclick="ingestUrl()">Fetch</button>
+      </div>
+      <div class="status" style="margin-top: 8px; font-size: 12px;">
+        Supports YouTube, Vimeo, X, TikTok, Instagram, and direct media URLs.
+      </div>
+    </div>
+
+    <div id="upload-status" class="status" style="margin-top: 12px;"></div>
+    <video id="player" controls style="display:none;"></video>
+  </div>
+
+  <div class="card" id="ops" style="display:none;">
+    <div class="tab-row">
+      <button class="tab active" data-tab="describe">Describe</button>
+      <button class="tab" data-tab="find">Find</button>
+      <button class="tab" data-tab="summarise">Summarise</button>
+      <button class="tab" data-tab="ask">Ask</button>
+    </div>
+
+    <div class="tab-panel active" data-tab="describe">
+      <p class="sub">Dense caption with scene + event timestamps.</p>
+      <button onclick="runDescribe()">Describe video</button>
+    </div>
+
+    <div class="tab-panel" data-tab="find">
+      <p class="sub">Find moments by natural-language query.</p>
+      <input type="text" id="find-query" placeholder='e.g. "when the person sits down"' />
+      <button onclick="runFind()" style="margin-top:8px;">Find</button>
+    </div>
+
+    <div class="tab-panel" data-tab="summarise">
+      <p class="sub">3–5 bullet summary with timestamps.</p>
+      <button onclick="runSummarise()">Summarise</button>
+    </div>
+
+    <div class="tab-panel" data-tab="ask">
+      <p class="sub">Open-ended Q&A grounded in the video.</p>
+      <textarea id="ask-question" placeholder="e.g. Why did the person walk away?"></textarea>
+      <button onclick="runAsk()" style="margin-top:8px;">Ask</button>
+    </div>
+
+    <div id="result" style="margin-top: 16px;"></div>
+  </div>
+</div>
+
+<script>
+const API = "http://localhost:8000";
+let currentVideoId = null;
+let currentVideoUrl = null;
+
+// Source tabs (upload vs URL)
+document.querySelectorAll("#source-tabs .tab").forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll("#source-tabs .tab").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll('.tab-panel[data-src]').forEach(x => x.classList.remove("active"));
+    t.classList.add("active");
+    document.querySelector(`.tab-panel[data-src="${t.dataset.src}"]`).classList.add("active");
+  };
+});
+
+// Operation tabs (describe/find/summarise/ask)
+document.querySelectorAll(".tab[data-tab]").forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll(".tab[data-tab]").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll(".tab-panel[data-tab]").forEach(x => x.classList.remove("active"));
+    t.classList.add("active");
+    document.querySelector(`.tab-panel[data-tab="${t.dataset.tab}"]`).classList.add("active");
+    document.getElementById("result").innerHTML = "";
+  };
+});
+
+async function upload() {
+  const file = document.getElementById("file").files[0];
+  if (!file) return setStatus("upload-status", "Pick a file first.", true);
+  setStatus("upload-status", `Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)…`);
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch(`${API}/v1/videos`, { method: "POST", body: fd });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    onVideoReady(data, URL.createObjectURL(file));
+  } catch (e) {
+    setStatus("upload-status", `✗ ${e.message}`, true);
+  }
+}
+
+async function ingestUrl() {
+  const url = document.getElementById("url").value.trim();
+  if (!url) return setStatus("upload-status", "Paste a URL first.", true);
+  setStatus("upload-status", `Fetching ${url}… (YouTube downloads take 5-30s)`);
+  try {
+    const r = await fetch(`${API}/v1/videos/from-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    // Backend has the file; we can't stream it back as a blob URL, so just
+    // show metadata and let the user play from source. For YouTube, embed
+    // would require a separate iframe; out of scope for v0.1.
+    onVideoReady(data, null);
+  } catch (e) {
+    setStatus("upload-status", `✗ ${e.message}`, true);
+  }
+}
+
+function onVideoReady(data, localBlobUrl) {
+  currentVideoId = data.video_id;
+  const player = document.getElementById("player");
+  if (localBlobUrl) {
+    currentVideoUrl = localBlobUrl;
+    player.src = localBlobUrl;
+    player.style.display = "block";
+  } else {
+    player.style.display = "none";
+  }
+  document.getElementById("ops").style.display = "block";
+  const tag = data.source_type === "yt-dlp"
+    ? `via yt-dlp (${data.title || "untitled"})`
+    : data.source_type === "direct" ? "direct URL" : "uploaded";
+  setStatus(
+    "upload-status",
+    `✓ Ready · ${tag} · ${data.duration_seconds.toFixed(1)}s · video_id=${data.video_id}`
+  );
+}
+
+function setStatus(id, msg, isErr) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = "status" + (isErr ? " err" : "");
+}
+
+function setBusy(busy) {
+  document.querySelectorAll("button").forEach(b => b.disabled = busy);
+}
+
+function tsChip(seconds) {
+  return `<span class="ts-chip" onclick="seek(${seconds})">${fmtTime(seconds)}</span>`;
+}
+
+function fmtTime(s) {
+  const m = Math.floor(s / 60), sec = (s % 60).toFixed(1);
+  return `${m}:${sec.padStart(4, "0")}`;
+}
+
+function seek(s) {
+  const p = document.getElementById("player");
+  p.currentTime = s;
+  p.play();
+}
+
+function modelBadge(name) {
+  return `<span class="model-badge">${name}</span>`;
+}
+
+async function runDescribe() {
+  await runOp("describe", "POST", {});
+}
+async function runFind() {
+  const query = document.getElementById("find-query").value.trim();
+  if (!query) return;
+  await runOp("find", "POST", { query });
+}
+async function runSummarise() {
+  await runOp("summarise", "POST", { style: "bullets" });
+}
+async function runAsk() {
+  const question = document.getElementById("ask-question").value.trim();
+  if (!question) return;
+  await runOp("ask", "POST", { question });
+}
+
+// Milestone 1: endpoints now enqueue Celery jobs and return {job_id,
+// status, status_url}. Poll status_url until SUCCESS or FAILURE.
+const POLL_INTERVAL_MS = 1500;
+const POLL_TIMEOUT_MS = 30 * 60 * 1000;  // 30 min hard ceiling (matches worker task_time_limit)
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function pollJob(statusUrl, onTick) {
+  const started = Date.now();
+  let lastStatus = null;
+  while (true) {
+    if (Date.now() - started > POLL_TIMEOUT_MS) {
+      throw new Error("Job polling timed out (30 min). Check Celery worker logs.");
+    }
+    const r = await fetch(statusUrl);
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    if (data.status !== lastStatus) {
+      lastStatus = data.status;
+      onTick(data.status);
+    }
+    if (data.status === "SUCCESS") return data.result;
+    if (data.status === "FAILURE") throw new Error(data.error || "Job failed");
+    if (data.status === "REVOKED") throw new Error("Job was revoked");
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+async function runOp(op, method, body) {
+  if (!currentVideoId) return;
+  setBusy(true);
+  const result = document.getElementById("result");
+  result.innerHTML = `<div class="status">Enqueuing ${op}…</div>`;
+  try {
+    const r = await fetch(`${API}/v1/videos/${currentVideoId}/${op}`, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const job = await r.json();
+    result.innerHTML = `<div class="status">Job ${job.job_id.slice(0, 8)}… queued</div>`;
+    const payload = await pollJob(job.status_url, status => {
+      // PENDING = queued behind a busy worker (or unknown id).
+      // STARTED = worker has picked it up and is running inference.
+      const label = status === "STARTED"
+        ? "Running inference (first call cold-starts model, ~30-90s)…"
+        : status === "PENDING" ? "Waiting for a worker…"
+        : `Job state: ${status}`;
+      result.innerHTML = `<div class="status">${label} <span style="color:var(--muted);font-size:11px;">[${job.job_id.slice(0, 8)}]</span></div>`;
+    });
+    renderResult(op, payload);
+  } catch (e) {
+    result.innerHTML = `<div class="status err">✗ ${e.message}</div>`;
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderResult(op, data) {
+  const r = document.getElementById("result");
+  let html = modelBadge(data.model) + "<br/><br/>";
+
+  if (op === "describe") {
+    html += `<div><strong>Summary:</strong><br/>${escapeHtml(data.summary)}</div>`;
+    if (data.events?.length) {
+      html += `<div style="margin-top:12px;"><strong>Events:</strong></div>`;
+      html += `<div class="timestamps">`;
+      data.events.forEach(e => {
+        html += `<span class="ts-chip" onclick="seek(${e.timestamp})">${fmtTime(e.timestamp)} · ${escapeHtml(e.event)}</span>`;
+      });
+      html += `</div>`;
+    }
+    if (data.scenes?.length) {
+      html += `<div style="margin-top:12px;"><strong>Scenes:</strong></div>`;
+      data.scenes.forEach(s => {
+        html += `<div style="margin-top:6px;">${tsChip(s.start)} — ${tsChip(s.end)} <span style="color:var(--muted);">${escapeHtml(s.caption)}</span></div>`;
+      });
+    }
+  } else if (op === "find") {
+    if (!data.matches?.length) {
+      html += `<div class="status">No matches.</div>`;
+    } else {
+      html += `<div><strong>${data.matches.length} match(es) for "${escapeHtml(data.query)}":</strong></div>`;
+      data.matches.forEach(m => {
+        html += `<div style="margin-top:6px;">${tsChip(m.start)}–${tsChip(m.end)} <span style="color:var(--muted);">${escapeHtml(m.description || "")}</span></div>`;
+      });
+    }
+  } else if (op === "summarise") {
+    html += `<ul>`;
+    data.bullets.forEach(b => { html += `<li>${escapeHtml(b)}</li>`; });
+    html += `</ul>`;
+  } else if (op === "ask") {
+    html += `<div><strong>Q:</strong> ${escapeHtml(data.question)}</div>`;
+    html += `<div style="margin-top:8px;"><strong>A:</strong> ${escapeHtml(data.answer)}</div>`;
+  }
+
+  html += `<details style="margin-top:12px;"><summary class="status">Raw output</summary><pre>${escapeHtml(data.raw_output || "")}</pre></details>`;
+  r.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+</script>
+</body>
+</html>

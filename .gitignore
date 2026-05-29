@@ -1,0 +1,65 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Secrets / config ---
+# Real env file (commit .env.example, never .env)
+.env
+.env.local
+
+# Modal CLI auth — lives in ~/.modal.toml, but ignore if anyone copies it in
+.modal.toml
+
+# --- Runtime / detached uvicorn artifacts ---
+uvicorn.pid
+uvicorn.err.log
+uvicorn.out.log
+*.log
+
+# --- Local storage (videos, frames, model caches) ---
+# CLIP_STORAGE_DIR target — videos shouldn't live in source control
+clip-storage/
+storage/
+tmp/
+
+# Downloaded videos in any form
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.m4v
+*.avi
+# Exception: if you commit a tiny reference clip for tests, un-ignore via:
+# !tests/fixtures/sample.mp4
+
+# Model weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- Jupyter / Colab ---
+.ipynb_checkpoints/

@@ -1,0 +1,49 @@
+# Core API
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pydantic>=2.9.0
+
+# Remote GPU backend (used when CLIP_BACKEND=modal — the default for non-NVIDIA
+# machines). Needs a one-time `modal setup` to authenticate this machine.
+modal>=0.66.0
+
+# Model inference — only consumed at runtime when CLIP_BACKEND=local.
+# Safe to install on non-CUDA machines (pip pulls a CPU-only torch build),
+# but never imported by inference.py unless you flip to the local backend.
+torch>=2.4.0
+transformers>=4.46.0
+accelerate>=1.0.0
+qwen-vl-utils>=0.0.10
+pillow>=10.4.0
+safetensors>=0.4.5
+# Optional: vLLM for milestone 3
+# vllm>=0.6.0
+
+# Video processing
+av>=13.0.0           # PyAV — ffmpeg bindings
+opencv-python>=4.10.0
+imageio>=2.36.0
+imageio-ffmpeg>=0.5.1
+
+# Async job queue (milestone 1) — using Modal's native FunctionCall.spawn / from_id
+# rather than Celery. Redis is still here for metadata + job-record storage
+# (see store.py); we just don't run a separate worker process.
+redis>=5.2.0
+
+# Storage
+boto3>=1.35.0        # S3 / R2 / MinIO
+
+# URL ingestion
+yt-dlp>=2024.10.7    # YouTube / Vimeo / Twitter / TikTok / ~1000 sites
+# ffmpeg is required by yt-dlp at runtime — install via OS package manager
+
+# DB (milestone 1)
+sqlalchemy>=2.0.0
+psycopg[binary]>=3.2.0
+alembic>=1.13.0
+
+# Utils
+python-dotenv>=1.0.0
+httpx>=0.27.0
+structlog>=24.4.0
