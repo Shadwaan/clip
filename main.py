@@ -47,6 +47,7 @@ import modal
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import downloader
 import inference
@@ -95,6 +96,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# FastAPI swallows the underlying exception when multipart parsing fails and
+# returns the bare "There was an error parsing the body" 400. That leaves you
+# staring at uvicorn logs with no traceback. This handler unwinds __cause__
+# so the real culprit (disk full, OneDrive placeholder, parser version skew,
+# truncated stream, etc.) lands in uvicorn.err.log on the very next attempt.
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 400 and exc.detail == "There was an error parsing the body":
+        chain: list[str] = []
+        cur = exc.__cause__ or exc.__context__
+        while cur is not None and len(chain) < 5:
+            chain.append(f"{type(cur).__name__}: {cur}")
+            cur = cur.__cause__ or cur.__context__
+        log.error(
+            "Body parse failure on %s %s — cause chain: %s",
+            request.method,
+            request.url.path,
+            " <- ".join(chain) or "<no __cause__>",
+        )
+        # Echo the cause to the client too so the browser shows something
+        # actionable instead of the generic FastAPI message.
+        detail = chain[0] if chain else exc.detail
+        return JSONResponse({"detail": f"Body parse failed: {detail}"}, status_code=400)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
 
 # ---------- Helpers ----------

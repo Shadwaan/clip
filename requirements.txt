@@ -1,7 +1,7 @@
 # Core API
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
-python-multipart>=0.0.12
+python-multipart>=0.0.20   # 0.0.12 had multipart-parsing bugs vs newer Starlette; pin floor higher
 pydantic>=2.9.0
 
 # Remote GPU backend (used when CLIP_BACKEND=modal — the default for non-NVIDIA
