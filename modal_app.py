@@ -37,6 +37,26 @@ import modal
 
 APP_NAME = "clip-marlin"
 MODEL_REPO = "NemoStation/Marlin-2B"
+
+# Marlin's native caption() has a ~130s temporal horizon: its internal frame
+# sampler caps total frames, so for any video longer than ~130s it only "sees"
+# the first ~130s, then degenerates into a repetition loop with wrapped
+# timestamps (diagnosed on a 907.3s webm — job 07e1a7fc…, where timestamps
+# climbed to 129.5s then reset to 30.0 and looped). We stay safely under that
+# horizon by captioning the video in <=CHUNK_SEC windows and re-offsetting each
+# window's chunk-relative timestamps by its start.
+#
+# Accuracy note: chunk boundaries are cut with ffmpeg stream-copy (-c copy),
+# which can only cut on keyframes. Each chunk is offset by its nominal
+# i*CHUNK_SEC source position, and caption() drops each chunk's overshoot
+# events (relative start >= CHUNK_SEC) so adjacent stream-copy segments — which
+# can run a few seconds past their nominal window — don't overlap. The result
+# is a strictly monotonic timeline bounded by the real video duration.
+# Absolute timestamps can still be off by up to ±keyframe-interval (typically
+# 2-10s) where a segment's first keyframe precedes its nominal start. Frame-
+# accurate cuts would require re-encoding each segment (much slower); the
+# ±keyframe drift is acceptable for captioning.
+CHUNK_SEC = 120
 QWEN_REPO = "Qwen/Qwen3-VL-8B-Instruct"   # Open-ended reasoning model (PRD §5.4 → /ask)
 GPU_TYPE = "A10G"      # 24 GB; comfortable for Marlin-2B (~5 GB needed)
 QWEN_GPU = "A10G"      # 24 GB; tight for Qwen3-VL-8B-Instruct in bf16 (~18 GB weights).
@@ -131,7 +151,11 @@ model_cache = modal.Volume.from_name("clip-model-cache", create_if_missing=True)
     # token to download weights. Create the secret once:
     #     modal secret create huggingface-secret HF_TOKEN=hf_xxx
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=600,            # max seconds a single inference call can take
+    # Long videos are captioned in <=CHUNK_SEC chunks (see caption()), so a
+    # single request can make N sequential model.caption() calls. Budget for
+    # the worst case: a ~15 min video is ~8 chunks. 1800s gives headroom over
+    # the old 600s single-call ceiling.
+    timeout=1800,           # max seconds a single inference call can take
     scaledown_window=120,   # keep container warm for 2 minutes after last request
     # Don't retry .enter failures forever — surface them after one attempt.
     retries=0,
@@ -246,8 +270,51 @@ class MarlinModel:
         inference" and is the source of the timestamp compression bug
         we hit during v0.1 testing.
         """
+        import math
         import os
+        import re
+        import subprocess
         import tempfile
+
+        # ---- helpers (local to keep the Modal method self-contained) ----
+        tag_re = re.compile(r"<\s*(\d+(?:\.\d+)?)\s*[-–:,]\s*(\d+(?:\.\d+)?)\s*>")
+
+        def probe_duration(path: str) -> float:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, check=True,
+            )
+            return float(out.stdout.strip())
+
+        def split_native(text: str):
+            """Return (scene_paragraph, events_block) from Marlin's native output."""
+            ev = re.search(r"^\s*Events:\s*", text, re.IGNORECASE | re.MULTILINE)
+            sc = re.search(r"^\s*Scene:\s*", text, re.IGNORECASE | re.MULTILINE)
+            if ev and sc and ev.start() > sc.start():
+                return text[sc.end():ev.start()].strip(), text[ev.end():]
+            return "", text  # no recognizable header — treat all as events
+
+        def offset_and_filter(events_block: str, offset: float, max_rel: float) -> str:
+            """Offset each chunk-relative <a-b> tag by `offset`, but first DROP
+            any tag whose relative start is >= max_rel. Stream-copy segments can
+            run a few seconds past their nominal CHUNK_SEC window; those overshoot
+            events are re-captioned by the next chunk, so dropping them here (and
+            keeping the nominal i*CHUNK_SEC offset) yields a strictly monotonic,
+            non-inflated timeline. Lines without a tag are dropped (the gateway
+            parser ignores them anyway)."""
+            out_lines = []
+            for line in events_block.splitlines():
+                m = tag_re.search(line)
+                if not m:
+                    continue
+                rel_start = float(m.group(1))
+                if rel_start >= max_rel:
+                    continue  # overlap into the next chunk's window — skip
+                new_tag = (f"<{rel_start + offset:.1f} - "
+                           f"{float(m.group(2)) + offset:.1f}>")
+                out_lines.append(tag_re.sub(new_tag, line, count=1))
+            return "\n".join(out_lines)
 
         # Marlin's internal decoder needs a real file on disk. Write the
         # incoming bytes to a tempfile in the container's filesystem,
@@ -258,18 +325,74 @@ class MarlinModel:
             f.write(video_bytes)
             video_path = f.name
 
+        segments: list[str] = []
         try:
-            result = self.model.caption(
-                video_path, max_new_tokens=max_new_tokens
+            duration = probe_duration(video_path)
+
+            # Short enough to caption in one pass — original behaviour.
+            if duration <= CHUNK_SEC + 10:
+                result = self.model.caption(
+                    video_path, max_new_tokens=max_new_tokens
+                )
+                # Marlin's caption() returns a dict with "caption" (raw text),
+                # "scene" (parsed paragraph), and "events" (list of parsed
+                # dicts). We return just the raw text and let the gateway's
+                # routing.parse_describe handle structured extraction — keeps
+                # parsing consistent across model backends.
+                return {"raw": result["caption"]}
+
+            # Long video: split into <=CHUNK_SEC windows, caption each, offset
+            # its chunk-relative timestamps by the window start, and stitch
+            # back into one native-format string so routing.parse_describe is
+            # unchanged. See the CHUNK_SEC comment for the ±keyframe drift the
+            # stream-copy split introduces.
+            n_chunks = math.ceil(duration / CHUNK_SEC)
+            print(f"[modal_app] caption: duration={duration:.1f}s > {CHUNK_SEC}s "
+                  f"horizon; chunking into {n_chunks} segments")
+
+            scene_parts: list[str] = []
+            event_blocks: list[str] = []
+            # Each chunk is offset by its nominal i*CHUNK_SEC source position
+            # (NOT cumulative probed durations, which double-count overlapping
+            # stream-copy segments and inflate the timeline past the real
+            # duration). offset_and_filter drops each chunk's overshoot events
+            # (relative start >= CHUNK_SEC) so adjacent chunks don't overlap and
+            # the stitched timeline stays strictly monotonic and bounded.
+            for i in range(n_chunks):
+                start = i * CHUNK_SEC
+                seg = tempfile.NamedTemporaryFile(suffix=f".{video_ext}", delete=False)
+                seg.close()
+                segments.append(seg.name)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", str(start), "-t", str(CHUNK_SEC),
+                     "-i", video_path, "-c", "copy", "-reset_timestamps", "1",
+                     seg.name],
+                    capture_output=True, check=True,
+                )
+                chunk_raw = self.model.caption(
+                    seg.name, max_new_tokens=max_new_tokens
+                )["caption"]
+                scene, events = split_native(chunk_raw)
+                if scene:
+                    scene_parts.append(scene)
+                offset_block = offset_and_filter(
+                    events, float(start), float(CHUNK_SEC)
+                ).strip()
+                if offset_block:
+                    event_blocks.append(offset_block)
+
+            combined = (
+                "Scene: " + " ".join(scene_parts).strip()
+                + "\n\nEvents:\n" + "\n".join(event_blocks)
             )
-            # Marlin's caption() returns a dict with "caption" (raw text),
-            # "scene" (parsed paragraph), and "events" (list of parsed
-            # dicts). We return just the raw text and let the gateway's
-            # routing.parse_describe handle structured extraction — keeps
-            # parsing consistent across model backends.
-            return {"raw": result["caption"]}
+            return {"raw": combined}
         finally:
             os.unlink(video_path)
+            for s in segments:
+                try:
+                    os.unlink(s)
+                except OSError:
+                    pass
 
     @modal.method()
     def find(
