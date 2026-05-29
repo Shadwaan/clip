@@ -1,138 +1,161 @@
 # Clip 🎬
 
-**Ask questions of any video.** Self-hostable, open-weights video understanding platform built on [Marlin-2B](https://huggingface.co/NemoStation/Marlin-2B) and [TimeLens-8B](https://huggingface.co/TencentARC/TimeLens-8B).
+**Ask questions of any video.** Self-hostable, open-weights video understanding platform built on [Marlin-2B](https://huggingface.co/NemoStation/Marlin-2B) and [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct).
+
+> **Status:** v0.1 — Milestone 1 chunk (a) shipped. Async job queue via Modal's native `FunctionCall.spawn` / `from_id`. All four endpoints (`/describe`, `/find`, `/summarise`, `/ask`) verified end-to-end. See `BUILD_LOG.md` for the full journey.
 
 ## What it does
 
 - **Describe** a video → dense paragraph + scene/event breakdown with timestamps
 - **Find** moments by natural language → `(start, end)` ranges
-- **Summarise** long video → chapters or bullets
-- **Ask** open-ended questions → grounded answers
+- **Summarise** long video → bullet-point chapters
+- **Ask** open-ended questions → grounded answers via Qwen3-VL
 
-## Why these models
+## Models & routing
 
-| | Marlin-2B | TimeLens-8B | Gemini-2.5-Flash |
-|---|---|---|---|
-| Params | 2B | 8B | proprietary |
-| VRAM (bf16) | ~5 GB | ~18 GB | n/a |
-| Dense captioning (DREAM-1K) | tops CaReBench; sits between Tarsier-34B and Gemini-1.5-Pro | strong | strong |
-| Temporal grounding (TimeLens-Bench) | beats Qwen2.5-VL-7B | SOTA open-source, surpasses GPT-5 | beaten by TimeLens-8B |
-| Self-hostable | ✅ | ✅ | ❌ |
-| Cost per min of video (self-hosted A10) | ~$0.005 | ~$0.02 | ~$0.30 (API) |
+| Endpoint | Model | Why |
+|---|---|---|
+| `/describe`, `/find`, `/summarise` | **Marlin-2B** | Native temporal grounding, ~5 GB VRAM, runs cheap on an A10G |
+| `/ask` | **Qwen3-VL-8B-Instruct** | Actual reasoning (Marlin is a captioner, can't answer "why" questions) |
 
-**Default routing:**
-- Short videos (<10 min) → Marlin-2B
-- Long videos OR precise temporal queries → TimeLens-8B
-- Force with `?model=marlin-2b` or `?model=timelens-8b`
+Both classes live in one deployed Modal app (`clip-marlin`) and scale independently. TimeLens-8B is in the PRD roadmap for longer videos / precision temporal queries but is not deployed in v0.1.
 
-## Architecture
+## Architecture (as actually shipped)
 
 ```mermaid
 graph LR
-    A[Client] -->|POST /v1/videos| B[FastAPI Gateway]
-    B --> C[(Postgres)]
-    B --> D[Redis Queue]
-    D --> E[Celery Worker GPU 0<br/>Marlin-2B]
-    D --> F[Celery Worker GPU 1<br/>TimeLens-8B]
-    E --> G[(S3 / MinIO)]
-    F --> G
-    E -.callback.-> B
-    F -.callback.-> B
-    B -->|webhook| A
+    A[Client] -->|POST /v1/videos/.../describe| B[FastAPI Gateway]
+    A -->|GET /v1/jobs/id, poll| B
+    B <-->|video + job metadata| C[(Redis / Memurai)]
+    B -->|FunctionCall.spawn| D{Modal: clip-marlin app}
+    B -.->|FunctionCall.from_id.get| D
+    D --> E[MarlinModel A10G<br/>caption / find / generate]
+    D --> F[QwenVL A10G<br/>ask]
 ```
 
-See [`docs/PRD.md`](./docs/PRD.md) for the full product spec.
+- **Modal IS the job queue.** No Celery worker, no Docker Redis-as-broker. `submit_caption` etc. call `.spawn()`; `get_job` polls via `FunctionCall.from_id(object_id).get(timeout=0)`.
+- **Redis (Memurai on Windows) holds metadata only** — video records and per-job context (which endpoint enqueued it, video duration, model that ran). 7-day TTL on jobs aligns with Modal's output retention.
+- **Postgres + S3 are planned** for chunk (b) — currently videos live on `/tmp/clip-storage` and metadata is Redis-backed (stopgap, single-box).
 
-## Quickstart (local, single GPU)
+See [`PRD.md`](./PRD.md) for the full product spec and [`BUILD_LOG.md`](./BUILD_LOG.md) for build history.
 
-### Requirements
-- Linux/macOS with NVIDIA GPU (8+ GB VRAM for Marlin, 24+ GB for TimeLens)
-- Python 3.11+
-- ffmpeg
-- CUDA 12.1+
+## Quickstart (Windows + Modal backend)
 
-### 1. Backend
+Tested on Windows 11 + PowerShell. Linux/macOS works the same way; substitute the Memurai install for `redis-server` from your package manager.
 
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
+### Prerequisites
+
+1. **Python 3.10+** and **ffmpeg** (yt-dlp dependency).
+2. **Memurai Developer Edition** (Windows-native Redis): https://www.memurai.com/get-memurai → MSI install → auto-runs as a Windows service on port 6379.
+3. **Modal account + CLI**: `pip install modal && modal setup`.
+4. **HuggingFace gated access** to Marlin-2B (accept terms on the model card).
+5. **Modal secret** `huggingface-secret` containing `HF_TOKEN=hf_xxx`.
+
+### Setup
+
+```powershell
+# 1. Install deps
 pip install -r requirements.txt
 
-# First run downloads the model (~5 GB)
-uvicorn main:app --reload --port 8000
+# 2. Deploy Marlin + Qwen3-VL to Modal (one-time, ~5 min)
+modal deploy modal_app.py
+
+# 3. Start the gateway. Run detached so terminal focus can't kill it.
+$env:CLIP_BACKEND="modal"
+Start-Process uvicorn -ArgumentList "main:app --host 0.0.0.0 --port 8000" `
+    -RedirectStandardError uvicorn.err.log -PassThru |
+    Select-Object -ExpandProperty Id |
+    Out-File uvicorn.pid
+
+# Sanity check
+curl.exe http://localhost:8000/healthz
+# → {"status":"ok","version":"0.1.2"}
 ```
 
-### 2. Try it (curl)
+### Try it
 
-```bash
-# Option A: upload a local file
-VIDEO_ID=$(curl -s -F "file=@sample.mp4" http://localhost:8000/v1/videos | jq -r .video_id)
+```powershell
+# Ingest a video (URL or upload)
+$r = Invoke-RestMethod -Method POST -Uri http://localhost:8000/v1/videos/from-url `
+    -ContentType application/json `
+    -Body (@{ url = "https://www.youtube.com/watch?v=bY8A66LjGBg" } | ConvertTo-Json)
+$VIDEO_ID = $r.video_id
 
-# Option B: pull from a URL (YouTube, Vimeo, X, TikTok, ~1000 sites, or any direct .mp4)
-VIDEO_ID=$(curl -s -X POST http://localhost:8000/v1/videos/from-url \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}' | jq -r .video_id)
+# Enqueue describe
+$job = Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/videos/$VIDEO_ID/describe"
+$JOB_ID = $job.job_id
 
-# Describe it
-curl -X POST http://localhost:8000/v1/videos/$VIDEO_ID/describe | jq
-
-# Find a moment
-curl -X POST http://localhost:8000/v1/videos/$VIDEO_ID/find \
-  -H "Content-Type: application/json" \
-  -d '{"query": "when does the person sit down"}' | jq
+# Poll to SUCCESS (~30-90s cold start, ~10-20s warm)
+while ($true) {
+    $r = Invoke-RestMethod "http://localhost:8000/v1/jobs/$JOB_ID"
+    Write-Host (Get-Date -Format HH:mm:ss) $r.status
+    if ($r.status -in @("SUCCESS","FAILURE")) { $r | ConvertTo-Json -Depth 6; break }
+    Start-Sleep 3
+}
 ```
 
-**URL ingestion note:** YouTube's ToS technically prohibits downloading. Self-host accordingly and require user accountability in your ToS for any URL submitted.
+Or just open `index.html` in a browser, paste a URL, click Describe.
 
-### 3. Frontend (optional)
+**URL ingestion note:** yt-dlp supports YouTube, Vimeo, X, TikTok, Instagram, and ~1000 other sites. YouTube's ToS technically restricts downloading; use accordingly.
 
-```bash
-cd frontend
-# Just open index.html in a browser, or:
-python -m http.server 5173
-# → http://localhost:5173
+### Stopping the gateway
+
+```powershell
+Stop-Process -Id (Get-Content uvicorn.pid)
 ```
 
-## Deployment
+## API
 
-### Option A: Modal (recommended for indie/dev)
-~$0.60/hr for A10. See `deploy/modal_app.py` (TODO M1).
+```
+POST /v1/videos                       upload (multipart) — returns {video_id, duration_seconds, ...}
+POST /v1/videos/from-url              JSON {url: "..."} — returns the same shape
+GET  /v1/videos/{id}                  metadata
 
-### Option B: HF Inference Endpoints
-Push the Marlin-2B repo as an endpoint; point `MODEL_BACKEND=hf_endpoint` in env.
+POST /v1/videos/{id}/describe         → {job_id, status: "PENDING", status_url}
+POST /v1/videos/{id}/find             body: {query: "..."}
+POST /v1/videos/{id}/summarise        body: {style: "bullets"}
+POST /v1/videos/{id}/ask              body: {question: "..."}
 
-### Option C: Self-hosted A10/A100
-Docker compose with one worker per GPU. See `deploy/docker-compose.yml` (TODO M1).
+GET  /v1/jobs/{id}                    → {job_id, status, result, error}
+                                        status ∈ PENDING|STARTED|SUCCESS|FAILURE
+                                        result shape varies by endpoint (DescribeResponse | FindResponse | ...)
+```
 
-### GPU not available locally?
-Marlin-2B runs on a free Colab T4 — see `notebooks/marlin_colab.ipynb` (TODO M1).
-Or use Modal/RunPod/Vast.ai for ~$0.50/hr.
+Force a specific model via `?model=marlin-2b|qwen3-vl-8b` on any endpoint.
 
 ## Project layout
 
 ```
-clip-video-analysis/
-├── backend/                FastAPI + Celery + model inference
-│   ├── main.py             API entrypoint
-│   ├── inference.py        Marlin / TimeLens wrappers
-│   ├── sampling.py         ffmpeg frame sampling
-│   ├── routing.py          model selection logic
-│   ├── schemas.py          Pydantic request/response models
-│   └── requirements.txt
-├── frontend/               Minimal HTML/JS client
-│   └── index.html
-├── docs/
-│   └── PRD.md              Product requirements doc
-└── README.md
+clip/
+├── main.py                FastAPI gateway, endpoints, GET /v1/jobs parser dispatch
+├── inference.py           ModalVLM wrappers — sync (.remote) + spawn (.spawn) variants
+├── modal_app.py           Modal app definition: MarlinModel + QwenVL classes (A10G)
+├── store.py               Redis-backed metadata + job records
+├── routing.py             Model selection + output parsing (Marlin tags, HH:MM:SS, find spans)
+├── sampling.py            ffmpeg frame sampling for the prompted-generate fallback path
+├── downloader.py          yt-dlp wrapper for URL ingestion
+├── schemas.py             Pydantic request/response models incl. job envelopes
+├── constants.py           ModelChoice enum + HF repo mapping
+├── index.html             Minimal HTML/JS frontend with async polling loop
+├── PRD.md                 Product requirements doc
+├── BUILD_LOG.md           Dated session-by-session build journal (decisions + dead ends)
+└── requirements.txt
 ```
 
 ## Roadmap
 
-See [`docs/PRD.md` § 8](./docs/PRD.md#8-build-plan). Current: **Milestone 0 — Spike**.
+See [`PRD.md § 8`](./PRD.md#8-build-plan). Current state:
+
+- ✅ Milestone 0 — Spike
+- 🚧 Milestone 1
+  - ✅ Async job queue (Modal-native — chunk a)
+  - ⏳ S3-compatible storage + Postgres metadata (chunk b)
+  - ⏳ Next.js frontend with video player + timestamp-jump (chunk c)
+- ⏳ Milestone 2 — TimeLens-8B, webhooks, API key auth, HF Spaces demo
 
 ## Credits & licences
 
 - [Marlin-2B](https://huggingface.co/NemoStation/Marlin-2B) — Apache 2.0
-- [TimeLens-8B](https://huggingface.co/TencentARC/TimeLens-8B) — custom (commercial use TBD; check model card)
-- [Qwen3-VL](https://huggingface.co/Qwen) base — Apache 2.0 (Alibaba)
+- [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) — Apache 2.0 (Alibaba)
+- [TimeLens-8B](https://huggingface.co/TencentARC/TimeLens-8B) (planned) — custom; check model card
 - Papers: [Marlin (arxiv:2501.00513)](https://arxiv.org/abs/2501.00513) · [TimeLens (arxiv:2512.14698)](https://arxiv.org/abs/2512.14698)
