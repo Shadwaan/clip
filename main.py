@@ -581,4 +581,13 @@ def get_job(job_id: str):
 @app.exception_handler(Exception)
 async def unhandled(_, exc: Exception):
     log.exception("Unhandled error")
-    return JSONResponse(status_code=500, content={"detail": str(exc)})
+    # ServerErrorMiddleware (which dispatches this Exception handler) sits
+    # OUTSIDE CORSMiddleware, so 500s would otherwise reach the browser with
+    # no Access-Control-Allow-Origin header and surface as an opaque "Failed
+    # to fetch" instead of the real error. Mirror the allow_origins=["*"]
+    # config here so server errors are actually readable client-side.
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
