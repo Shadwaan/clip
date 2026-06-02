@@ -94,6 +94,21 @@ class AskResponse(BaseModel):
     raw_output: Optional[str] = None
 
 
+class LinkHit(BaseModel):
+    """One URL detected on-screen, clustered across all frames it appeared in."""
+    url: str
+    first_seen: float          # seconds — earliest frame the URL appeared in
+    last_seen: float           # seconds — latest frame the URL appeared in
+    occurrences: int           # number of sampled frames it appeared in
+
+
+class LinksResponse(BaseModel):
+    video_id: str
+    links: List[LinkHit] = []
+    frames_processed: int = 0
+    raw_output: Optional[Any] = None  # for debugging (raw OCR backend payload)
+
+
 class ErrorResponse(BaseModel):
     detail: str
 

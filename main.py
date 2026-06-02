@@ -10,6 +10,7 @@ Endpoints:
   POST /v1/videos/{id}/find       enqueue find job     → {job_id}
   POST /v1/videos/{id}/summarise  enqueue summarise job→ {job_id}
   POST /v1/videos/{id}/ask        enqueue ask job      → {job_id}
+  POST /v1/videos/{id}/links      enqueue OCR link-extraction job → {job_id}
   GET  /v1/jobs/{id}              poll job status + result
   GET  /healthz
 
@@ -65,6 +66,7 @@ from schemas import (
     IngestFromURLRequest,
     JobEnqueueResponse,
     JobStatusResponse,
+    LinksResponse,
     Match,
     SummariseRequest,
     SummariseResponse,
@@ -427,6 +429,40 @@ def ask(request: Request, video_id: str, req: AskRequest):
     return _job_envelope(request, job_id)
 
 
+@app.post("/v1/videos/{video_id}/links", response_model=JobEnqueueResponse)
+def links(request: Request, video_id: str):
+    """
+    Extract URLs visible on-screen in the video frames (screenshares,
+    lower-thirds, browser bars), with the timestamps where each appeared.
+
+    Runs the dedicated `clip-ocr` Modal app (OCR pipeline, see modal_ocr.py)
+    — separate from the VLM captioning app, so there's no routing.choose_model
+    here. The OCR pipeline is the only backend; if clip-ocr isn't deployed,
+    get_ocr() raises and we surface a 501 (same shape as the spawn-unsupported
+    guards on the VLM endpoints).
+    """
+    meta = _require_video(video_id)
+    duration = meta["duration"]
+
+    try:
+        ocr = inference.get_ocr()
+    except RuntimeError as e:
+        # clip-ocr app not deployed / unreachable.
+        raise HTTPException(
+            501,
+            f"OCR backend unavailable: {e}",
+        )
+
+    object_id = ocr.submit_extract_links(meta["path"])
+    job_id = uuid.uuid4().hex
+    _stash_job(
+        job_id, object_id, "links", video_id, duration,
+        inference.ModalOCR.MODEL_LABEL,
+    )
+    log.info(f"spawned links job={job_id} modal={object_id}")
+    return _job_envelope(request, job_id)
+
+
 # ---------- Result parsing on GET /v1/jobs/{id} ----------
 #
 # Each parser takes the job record + the raw Modal return value and
@@ -496,11 +532,25 @@ def _parse_ask(job: dict, raw_result: dict) -> dict:
     ).model_dump()
 
 
+def _parse_links(job: dict, raw_result: dict) -> dict:
+    # raw_result is the OCR backend payload: {"links": [...], "frames_processed": int}.
+    # parse_extract_links is a defensive normalizer; pydantic coerces the
+    # per-link dicts into LinkHit on construction.
+    parsed = inference.ModalOCR.parse_extract_links(raw_result)
+    return LinksResponse(
+        video_id=job["video_id"],
+        links=parsed["links"],
+        frames_processed=parsed["frames_processed"],
+        raw_output=raw_result,
+    ).model_dump()
+
+
 _PARSERS = {
     "describe": _parse_describe,
     "find": _parse_find,
     "summarise": _parse_summarise,
     "ask": _parse_ask,
+    "links": _parse_links,
 }
 
 

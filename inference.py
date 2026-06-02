@@ -496,6 +496,92 @@ class ModalVLM:
 
 
 # ============================================================
+# Modal OCR backend — on-screen URL extraction (clip-ocr app)
+# ============================================================
+
+class ModalOCR:
+    """
+    Thin client for the `clip-ocr` Modal app (see modal_ocr.py), mirroring
+    ModalVLM's shape but for the OCR pipeline.
+
+    OCR has a single backend (Modal) — there is no local OCR path and it does
+    NOT participate in the VLM model selector (routing.py / ModelChoice). So
+    unlike ModalVLM, this class isn't keyed by a model choice; it's a plain
+    handle to the one deployed OCRModel class.
+
+    Frame sampling + OCR + URL extraction all happen inside the Modal
+    container; the gateway just ships the video bytes and polls the result.
+    """
+
+    _OCR_APP = "clip-ocr"
+    _OCR_CLS = "OCRModel"
+
+    # Stable label used as the job record's `model` field (the OCR pipeline
+    # isn't a ModelChoice, but the job envelope/UI expect a model string).
+    MODEL_LABEL = "clip-ocr/easyocr"
+
+    def __init__(self):
+        import modal
+        try:
+            self._remote_cls = modal.Cls.from_name(self._OCR_APP, self._OCR_CLS)
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not find deployed Modal class {self._OCR_APP}/{self._OCR_CLS}. "
+                f"Run `modal deploy modal_ocr.py` first."
+            ) from e
+        self._remote = self._remote_cls()
+        log.info(f"Modal OCR backend ready ({self._OCR_APP} / {self._OCR_CLS})")
+
+    def submit_extract_links(self, video_path: str | Path) -> str:
+        """Spawn the OCR extract_links call. Returns FunctionCall.object_id.
+
+        Mirrors ModalVLM.submit_* : ship raw video bytes (the container writes
+        them to a tempfile for ffmpeg), spawn, return the object_id for the
+        gateway to stash and poll via GET /v1/jobs/{id}."""
+        video_path = Path(video_path)
+        video_bytes = video_path.read_bytes()
+        video_ext = video_path.suffix.lstrip(".") or "mp4"
+        log.info(
+            f"Spawning Modal extract_links ({len(video_bytes):,} bytes, "
+            f"ext={video_ext})..."
+        )
+        fn_call = self._remote.extract_links.spawn(
+            video_bytes=video_bytes,
+            video_ext=video_ext,
+        )
+        return fn_call.object_id
+
+    @staticmethod
+    def parse_extract_links(raw: dict) -> dict:
+        """Normalize the raw OCR backend payload into the keys the gateway's
+        LinksResponse needs. The Modal method already returns structured data
+        ({"links": [...], "frames_processed": int}); this is a defensive
+        pass-through so a malformed payload fails here rather than deep in the
+        pydantic constructor."""
+        return {
+            "links": raw.get("links", []),
+            "frames_processed": raw.get("frames_processed", 0),
+        }
+
+
+# Module-level OCR singleton (lazy). OCR has one backend regardless of
+# CLIP_BACKEND, so this isn't gated on it — the clip-ocr app must be deployed
+# on Modal either way.
+_ocr_singleton: "ModalOCR | None" = None
+
+
+def get_ocr() -> ModalOCR:
+    """Lazy, thread-safe singleton accessor for the OCR backend."""
+    global _ocr_singleton
+    if _ocr_singleton is not None:
+        return _ocr_singleton
+    with _load_lock:
+        if _ocr_singleton is None:
+            _ocr_singleton = ModalOCR()
+    return _ocr_singleton
+
+
+# ============================================================
 # Backend selector
 # ============================================================
 

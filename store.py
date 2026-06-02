@@ -121,15 +121,16 @@ def put_job(job_id: str, meta: dict) -> None:
     Expected shape (enforced by callers, not here):
       {
         "modal_object_id": str,           # FunctionCall.object_id
-        "endpoint":   "describe"|"find"|"summarise"|"ask",
+        "endpoint":   "describe"|"find"|"summarise"|"ask"|"links",
         "video_id":   str,
         "duration":   float,
-        "model":      str,                # ModelChoice.value of the model that ran
+        "model":      str,                # ModelChoice.value, or "clip-ocr/easyocr" for links
         # Per-endpoint extras needed by the parser:
         "query":     str,                 # find only
         "style":     str,                 # summarise only
         "question":  str,                 # ask only
         "used_fallback": bool,            # ask only — Marlin used when Qwen unreachable
+        # "links" needs no extras — the OCR payload is self-describing.
       }
 
     7-day TTL aligns with Modal's output retention; expired jobs match
