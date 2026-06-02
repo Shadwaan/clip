@@ -137,6 +137,7 @@
       <button class="tab" data-tab="find">Find</button>
       <button class="tab" data-tab="summarise">Summarise</button>
       <button class="tab" data-tab="ask">Ask</button>
+      <button class="tab" data-tab="links">Links</button>
     </div>
 
     <div class="tab-panel active" data-tab="describe">
@@ -159,6 +160,11 @@
       <p class="sub">Open-ended Q&A grounded in the video.</p>
       <textarea id="ask-question" placeholder="e.g. Why did the person walk away?"></textarea>
       <button onclick="runAsk()" style="margin-top:8px;">Ask</button>
+    </div>
+
+    <div class="tab-panel" data-tab="links">
+      <p class="sub">Extract URLs shown on-screen (OCR over 2 fps frames), with the timestamps where each appeared.</p>
+      <button onclick="runLinks()">Extract links</button>
     </div>
 
     <div id="result" style="margin-top: 16px;"></div>
@@ -293,6 +299,10 @@ async function runAsk() {
   if (!question) return;
   await runOp("ask", "POST", { question });
 }
+async function runLinks() {
+  // No body needed — the OCR endpoint keys only off video_id.
+  await runOp("links", "POST", {});
+}
 
 // Milestone 1: endpoints now enqueue Celery jobs and return {job_id,
 // status, status_url}. Poll status_url until SUCCESS or FAILURE.
@@ -355,7 +365,8 @@ async function runOp(op, method, body) {
 
 function renderResult(op, data) {
   const r = document.getElementById("result");
-  let html = modelBadge(data.model) + "<br/><br/>";
+  // /links has no `model` field (OCR isn't a VLM); fall back to a static badge.
+  let html = modelBadge(data.model || "clip-ocr") + "<br/><br/>";
 
   if (op === "describe") {
     html += `<div><strong>Summary:</strong><br/>${escapeHtml(data.summary)}</div>`;
@@ -389,9 +400,29 @@ function renderResult(op, data) {
   } else if (op === "ask") {
     html += `<div><strong>Q:</strong> ${escapeHtml(data.question)}</div>`;
     html += `<div style="margin-top:8px;"><strong>A:</strong> ${escapeHtml(data.answer)}</div>`;
+  } else if (op === "links") {
+    const n = data.links?.length || 0;
+    if (!n) {
+      html += `<div class="status">No on-screen URLs detected (${data.frames_processed || 0} frames scanned).</div>`;
+    } else {
+      html += `<div><strong>${n} link(s) found</strong> <span style="color:var(--muted);font-size:12px;">· ${data.frames_processed} frames scanned @ 2 fps</span></div>`;
+      data.links.forEach(l => {
+        const occ = `${l.occurrences} occurrence${l.occurrences === 1 ? "" : "s"}`;
+        // Timestamp label is non-interactive in v0 (player seek is a polish pass).
+        html += `<div style="margin-top:8px;">`
+          + `<span style="font-family:ui-monospace,monospace;color:var(--accent);font-size:12px;">[${fmtTime(l.first_seen)} - ${fmtTime(l.last_seen)}]</span> `
+          + `<a href="${escapeHtml(l.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);word-break:break-all;">${escapeHtml(l.url)}</a> `
+          + `<span style="color:var(--muted);font-size:12px;">(${occ})</span>`
+          + `</div>`;
+      });
+    }
   }
 
-  html += `<details style="margin-top:12px;"><summary class="status">Raw output</summary><pre>${escapeHtml(data.raw_output || "")}</pre></details>`;
+  // raw_output is a string for VLM ops but an object for /links — stringify it.
+  const rawStr = (typeof data.raw_output === "string")
+    ? data.raw_output
+    : JSON.stringify(data.raw_output ?? "", null, 2);
+  html += `<details style="margin-top:12px;"><summary class="status">Raw output</summary><pre>${escapeHtml(rawStr)}</pre></details>`;
   r.innerHTML = html;
 }
 
