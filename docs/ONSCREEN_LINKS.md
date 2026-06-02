@@ -96,10 +96,21 @@ clickable URL is worse. We keep raw OCR text available in `raw_output` for debug
 
 ## Sampling choice
 
-- **v0: fixed 2 fps.** Dead simple, catches text that lingers ≥0.5s.
+- **v0: up to 2 fps, capped to `MAX_FRAMES` (300) total.** Short videos sample at the full
+  2 fps; long videos drop to `MAX_FRAMES / duration` (e.g. a 15-min video → ~0.33 fps). This
+  cap was added 2026-06-02 after a 15-min meeting recording produced ~1,815 frames and ran 40+
+  min — dense screen-recording frames are slow because EasyOCR runs recognition once per detected
+  text box, and meeting UIs have hundreds per frame. Frames are also downscaled to
+  `DOWNSCALE_WIDTH` (1280px) before OCR to cut spurious tiny-text boxes. Both knobs are tunable:
+  raise them if URLs are missed, lower them for speed. A per-`OCR_PROGRESS_EVERY`-frame heartbeat
+  log makes long runs observably progressing, and `torch.cuda.is_available()` is logged at load
+  so a silent CPU fallback can't masquerade as "just slow."
+- **Trade-off:** sparser sampling can miss a URL that flashes on screen for only a second or two.
+  For the meeting use-case the URLs sit persistently in the chat, so the cap is safe; for
+  fast-cut content, lower the sampling interval or move to the follow-up below.
 - **Follow-up: PySceneDetect.** Scene-change-based sampling would OCR one representative frame
-  per shot instead of brute-forcing 2 fps — far fewer frames on static content, better coverage
-  of rapid cuts. Deferred; 2 fps is the honest v0 baseline.
+  per shot instead of fixed-interval sampling — far fewer frames on static content, better
+  coverage of rapid cuts. Deferred; the frame cap is the pragmatic v0 guard.
 
 ## Out of scope for v0
 

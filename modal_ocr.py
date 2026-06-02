@@ -19,7 +19,8 @@ How it works
   once (via `@modal.enter`) and keeps it warm for `scaledown_window` seconds.
 - `extract_links(video_bytes, video_ext)` is the remote method:
     1. write bytes to a tempfile,
-    2. ffmpeg-sample frames at 2 fps to JPGs (timestamp = frame_index / 2),
+    2. ffmpeg-sample frames (up to SAMPLE_FPS, capped to MAX_FRAMES total;
+       optionally downscaled to DOWNSCALE_WIDTH) to JPGs, recording timestamps,
     3. EasyOCR each frame → detected text strings,
     4. URL regex over each frame's text,
     5. dedupe identical URLs across frames into one entry with
@@ -44,8 +45,18 @@ APP_NAME = "clip-ocr"
 
 GPU_TYPE = "A10G"           # 24 GB; EasyOCR is light, but GPU makes 2 fps sampling tractable
 CACHE_DIR = "/cache"        # EasyOCR model_storage_directory (persisted on the volume)
-SAMPLE_FPS = 2              # v0: fixed 2 fps sampling (see docs §Sampling)
+SAMPLE_FPS = 2              # nominal max sampling rate (used for short videos)
 OCR_LANGS = ["en"]          # v0: English only
+
+# Cost/latency guards (added 2026-06-02 after a 15-min meeting recording produced
+# ~1,815 frames at 2 fps and ran 40+ min). Dense screen-recording frames are slow
+# because EasyOCR runs recognition once per detected text box, and meeting UIs
+# have hundreds per frame — so we (a) CAP the total frames OCR'd regardless of
+# duration, and (b) DOWNSCALE wide frames before OCR. Both are tunable: raise
+# MAX_FRAMES / DOWNSCALE_WIDTH if on-screen URLs are being missed; lower for speed.
+MAX_FRAMES = 300            # hard cap on frames OCR'd per video (effective fps = MAX_FRAMES/duration, capped at SAMPLE_FPS)
+DOWNSCALE_WIDTH = 1280      # cap frame width (px) before OCR; 0 disables downscaling
+OCR_PROGRESS_EVERY = 25     # heartbeat: log "frame N/total" every N frames
 
 # --- Container image ---
 # ffmpeg for frame extraction; easyocr pulls its own torch/opencv/numpy stack.
@@ -74,8 +85,8 @@ ocr_cache = modal.Volume.from_name("clip-ocr-cache", create_if_missing=True)
 @app.cls(
     gpu=GPU_TYPE,
     volumes={CACHE_DIR: ocr_cache},
-    # OCR over many frames at 2 fps is slow on long videos (a 10-min clip is
-    # ~1200 frames). Budget generously, same ceiling as the captioning app.
+    # OCR is frame-bound; even with the MAX_FRAMES cap, dense frames can take
+    # a few seconds each. Budget generously, same ceiling as the captioning app.
     timeout=1800,
     scaledown_window=120,   # keep warm 2 min after last request
     retries=0,
@@ -88,13 +99,21 @@ class OCRModel:
         """Run on container startup. Builds the EasyOCR reader (downloads
         weights into the volume on first cold start)."""
         import easyocr
+        import torch
 
-        print(f"[modal_ocr] Building EasyOCR reader (langs={OCR_LANGS}, gpu=True)...")
+        # Confirm GPU explicitly. EasyOCR silently falls back to (very slow) CPU
+        # if gpu=True but CUDA isn't visible — that ambiguity cost us a 40-min
+        # debugging detour, so we log it loudly and pass the real value through.
+        gpu_ok = torch.cuda.is_available()
+        device = torch.cuda.get_device_name(0) if gpu_ok else "CPU"
+        print(f"[modal_ocr] torch.cuda.is_available()={gpu_ok} device={device}")
+
+        print(f"[modal_ocr] Building EasyOCR reader (langs={OCR_LANGS}, gpu={gpu_ok})...")
         # model_storage_directory points EasyOCR at the persistent volume so
         # the ~100 MB English models download once across cold starts.
         self.reader = easyocr.Reader(
             OCR_LANGS,
-            gpu=True,
+            gpu=gpu_ok,
             model_storage_directory=CACHE_DIR,
             download_enabled=True,
         )
@@ -181,13 +200,44 @@ class OCRModel:
         frames_processed = 0
 
         try:
-            # Sample frames at SAMPLE_FPS. The fps filter emits frames at
-            # t = 0, 1/fps, 2/fps, ...; the k-th output file (0-indexed after
-            # sorting) is therefore at k / fps seconds.
+            # Probe duration + width to (a) cap the total frame count and
+            # (b) decide whether to downscale. ffprobe ships with ffmpeg.
+            def _probe(entries: str, stream: bool = False) -> str:
+                cmd = ["ffprobe", "-v", "error"]
+                if stream:
+                    cmd += ["-select_streams", "v:0"]
+                cmd += ["-show_entries", entries,
+                        "-of", "default=noprint_wrappers=1:nokey=1", video_path]
+                out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+
+            try:
+                duration = float(_probe("format=duration"))
+            except Exception:
+                duration = 0.0
+            try:
+                width = int(_probe("stream=width", stream=True))
+            except Exception:
+                width = 0
+
+            # Effective fps: enough to stay under MAX_FRAMES, never above SAMPLE_FPS.
+            # Short videos keep the full SAMPLE_FPS; long ones sample sparsely
+            # (e.g. a 907s video → 300/907 ≈ 0.33 fps). The k-th output frame
+            # (0-indexed after sorting) is at k / effective_fps seconds.
+            if duration > 0:
+                effective_fps = min(float(SAMPLE_FPS), MAX_FRAMES / duration)
+            else:
+                effective_fps = float(SAMPLE_FPS)
+
+            vf = f"fps={effective_fps:.6f}"
+            if DOWNSCALE_WIDTH and width and width > DOWNSCALE_WIDTH:
+                # Only ever downscale (never upscale); -2 keeps aspect, even height.
+                vf += f",scale={DOWNSCALE_WIDTH}:-2"
+
             frame_pattern = os.path.join(frame_dir, "frame_%06d.jpg")
             subprocess.run(
                 ["ffmpeg", "-y", "-i", video_path,
-                 "-vf", f"fps={SAMPLE_FPS}", "-q:v", "2", frame_pattern],
+                 "-vf", vf, "-q:v", "2", frame_pattern],
                 capture_output=True, check=True,
             )
 
@@ -195,11 +245,19 @@ class OCRModel:
                 fn for fn in os.listdir(frame_dir) if fn.endswith(".jpg")
             )
             frames_processed = len(frame_files)
-            print(f"[modal_ocr] Sampled {frames_processed} frames @ {SAMPLE_FPS} fps")
+            print(f"[modal_ocr] duration={duration:.1f}s width={width} -> "
+                  f"effective_fps={effective_fps:.4f}, vf='{vf}', "
+                  f"sampled {frames_processed} frames (cap {MAX_FRAMES})")
 
             for idx, fn in enumerate(frame_files):
-                timestamp = idx / float(SAMPLE_FPS)
+                timestamp = idx / effective_fps if effective_fps > 0 else 0.0
                 fpath = os.path.join(frame_dir, fn)
+
+                # Heartbeat so a long run is observably progressing (the silence
+                # here is what made the 1,815-frame run look hung).
+                if (idx + 1) % OCR_PROGRESS_EVERY == 0:
+                    print(f"[modal_ocr] OCR {idx + 1}/{frames_processed} frames, "
+                          f"{len(clusters)} url(s) so far")
 
                 # detail=0 → list of detected text strings (no bboxes/scores).
                 try:
