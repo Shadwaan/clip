@@ -159,24 +159,46 @@ class OCRModel:
         import tempfile
         from urllib.parse import urlparse
 
-        # ---- URL detection (v0) -------------------------------------------
-        # Anchor on an explicit http(s):// scheme OR a leading "www." — both
-        # are unambiguous URL signals. We deliberately do NOT match bare
-        # domains (e.g. "main.py", "index.io") because OCR of code/terminals
-        # produces filenames whose extensions collide with real ccTLDs
-        # (.py, .io, .sh, .rs). Requiring the scheme/www anchor keeps
-        # precision high — a missed URL is a v0 quality note; a wrong
-        # clickable URL is worse. Known limitation: scheme-less on-screen
-        # URLs ("github.com/foo") are skipped in v0.
-        url_re = re.compile(
-            r"(?i)\b(?:https?://|www\.)"   # required anchor: scheme or www.
-            r"[a-z0-9\-._~%]+"             # host (labels + dots)
-            r"\.[a-z]{2,24}"               # final dot + alphabetic TLD (rejects 1.2.3, v4.46.0)
-            r"(?::\d{2,5})?"               # optional :port
-            r"(?:/[^\s]*)?"                # optional /path?query#fragment
+        # ---- URL detection -------------------------------------------------
+        # Two passes, because real OCR mangles URL punctuation badly (diagnosed
+        # 2026-06-02 on a meeting recording: "https://erpdev.hameemgroup.com:8443/…"
+        # was read as "https /lerpdev hameemgroup com.8443/…" — the "://" became a
+        # space, domain dots became spaces). EasyOCR gets the *letters* right but
+        # the *punctuation* wrong, so a rigid syntax match finds nothing.
+        #
+        #   STRICT: clean, well-formed URLs (http(s):// or www.). High precision.
+        #   FUZZY:  tolerates OCR noise — optional scheme, host labels separated
+        #           by '.' OR spaces ending in a known TLD, mangled port, then path.
+        #           Reconstructs scheme://host[:port]/path. Requires a strong URL
+        #           signal (scheme OR port OR a "/path") so prose like "see us com"
+        #           and bare emails ("erp@hameemgroup.com") don't become links.
+        #
+        # Caveat: FUZZY recovers the host+port reliably; the path can still carry
+        # OCR letter errors (e.g. "erp/internal" read as "erpfinternal") — we keep
+        # the raw OCR string in url_candidates for ground truth.
+        KNOWN_TLDS = ("com", "net", "org", "io", "gov", "edu", "live", "info",
+                      "biz", "co", "us", "uk", "bd", "app", "dev", "ai", "xyz",
+                      "me", "tv")
+        _tld_alt = "|".join(KNOWN_TLDS)
+        strict_re = re.compile(
+            r"(?i)\b(?:https?://|www\.)[a-z0-9\-._~%]+\.[a-z]{2,24}"
+            r"(?::\d{2,5})?(?:/[^\s]*)?"
+        )
+        fuzzy_re = re.compile(
+            r"(?i)(?:(https?)://)?"
+            r"([a-z0-9][a-z0-9\-]*(?:[.\s]+[a-z0-9\-]+)*[.\s]+(?:" + _tld_alt + r"))"
+            r"(?:[.\s:]+(\d{2,5}))?"
+            r"((?:\s*/\s*)[^\n]*)?"
         )
         # Trailing punctuation that OCR / sentence context can glue onto a URL.
-        trailing = ".,;:!?\"')]}>«»"
+        trailing = ".,;:!?\"')]}>«» "
+
+        def _norm_scheme(text: str) -> str:
+            # Repair OCR-mangled scheme separators: "https /l", "https //",
+            # "https:/i", "http : / /" -> "https://" / "http://".
+            text = re.sub(r"(?i)\b(https?)\s*[:;]?\s*/\s*[/l|i]\s*", r"\1://", text)
+            text = re.sub(r"(?i)\b(https?)\s*[:;]?\s*//", r"\1://", text)
+            return text
 
         def canonicalize(raw_url: str) -> str:
             """Dedupe key + display form. Lowercase scheme+host, strip trailing
@@ -195,6 +217,35 @@ class OCRModel:
             if p.fragment:
                 tail += "#" + p.fragment
             return f"{scheme}://{host}{tail}"
+
+        def urls_in_text(text: str) -> set:
+            """Return canonical URLs found in a single OCR string, via the strict
+            pass then the OCR-tolerant fuzzy pass. Run per-detected-string (not on
+            the joined frame blob) so the space-tolerant fuzzy matcher can't stitch
+            a fake URL across unrelated text boxes."""
+            found = set()
+            for m in strict_re.finditer(text):
+                found.add(canonicalize(m.group(0)))
+            for m in fuzzy_re.finditer(_norm_scheme(text)):
+                scheme, host_raw, port, path = m.groups()
+                has_path = bool(path and "/" in path)
+                # Require a strong URL signal to avoid prose/email false positives.
+                if not (scheme or port or has_path):
+                    continue
+                host = re.sub(r"[.\s]+", ".", host_raw).strip(".").lower()
+                if host.count(".") < 1:
+                    continue
+                sch = scheme.lower() if scheme else ("https" if port in ("8443", "443") else "http")
+                url = f"{sch}://{host}"
+                if port:
+                    url += f":{port}"
+                if has_path:
+                    pth = re.sub(r"\s+", "", path)   # OCR sprinkles spaces into the path
+                    if not pth.startswith("/"):
+                        pth = "/" + pth
+                    url += pth.rstrip(trailing)
+                found.add(canonicalize(url))
+            return found
 
         # ---- write bytes to disk for ffmpeg --------------------------------
         with tempfile.NamedTemporaryFile(
@@ -278,22 +329,22 @@ class OCRModel:
                     print(f"[modal_ocr] OCR failed on {fn}: {e}")
                     continue
 
-                blob = " ".join(texts)
+                # Unique canonical URLs in THIS frame (so multiple hits in one
+                # frame count as a single occurrence). Run extraction per detected
+                # string so the fuzzy matcher can't span unrelated text boxes.
+                seen_in_frame = set()
+                for s in texts:
+                    seen_in_frame |= urls_in_text(s)
 
-                # Diagnostic: capture any individual OCR string that looks link-ish,
-                # even if the regex below rejects it. Lets us distinguish "didn't read
-                # the URL" from "read it garbled/fragmented".
-                if OCR_DEBUG_CANDIDATES:
-                    for s in texts:
+                    # Diagnostic: capture any individual OCR string that looks
+                    # link-ish, even if extraction rejected it. Lets us tell
+                    # "didn't see the URL" from "read it garbled".
+                    if OCR_DEBUG_CANDIDATES:
                         low = s.lower()
                         if any(tok in low for tok in _CANDIDATE_TOKENS):
                             print(f"[modal_ocr] url-ish @ {timestamp:.1f}s: {s!r}")
                             if len(url_candidates) < 100:
                                 url_candidates.append({"t": round(timestamp, 1), "text": s})
-
-                # Unique canonical URLs in THIS frame (so multiple hits in one
-                # frame count as a single occurrence).
-                seen_in_frame = {canonicalize(m) for m in url_re.findall(blob)}
                 for url in seen_in_frame:
                     entry = clusters.get(url)
                     if entry is None:

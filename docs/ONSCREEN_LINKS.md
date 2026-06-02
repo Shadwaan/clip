@@ -62,17 +62,28 @@ video bytes ──▶ ffmpeg sample @ 2 fps ──▶ [frame_0.jpg @ t0, frame_1
   (`HTTPS://Example.com/` ≡ `https://example.com`). `first_seen` = earliest timestamp,
   `last_seen` = latest, `occurrences` = count of frames it appeared in.
 
-### URL regex (v0 intent)
+### URL detection (strict + OCR-tolerant fuzzy)
 
-Accept `http`/`https` URLs with common TLDs, query strings (`?a=b`), and fragments (`#x`).
-Reject things that merely *look* URL-ish but aren't web links:
+Two passes, run **per detected OCR string** (not the joined frame text, so the
+space-tolerant fuzzy matcher can't stitch a fake URL across unrelated boxes):
 
-- file paths (`/usr/local/bin`, `C:\Users\...`),
-- version numbers / dotted identifiers (`1.2.3`, `v4.46.0`),
-- bare words with a dot but no valid TLD.
+1. **Strict** — clean, well-formed `http(s)://` / `www.` URLs with common TLDs, query
+   strings, fragments. High precision; rejects file paths, version numbers (`1.2.3`,
+   `v4.46.0`), and bare dotted words.
+2. **Fuzzy (OCR-tolerant)** — added 2026-06-02 after diagnosing real output: EasyOCR gets
+   URL *letters* right but mangles *punctuation*. `https://erpdev.hameemgroup.com:8443/…`
+   came out as `https /lerpdev hameemgroup com.8443/…` — `://` read as a space, domain dots
+   read as spaces. The fuzzy pass repairs the scheme (`https /l` → `https://`), accepts host
+   labels separated by `.` **or spaces** ending in a known TLD, tolerates a mangled `:port`,
+   then reconstructs `scheme://host[:port]/path`. To avoid prose/email false positives it
+   requires a strong signal — a scheme **or** a port **or** a `/path` — so `see us com` and
+   `erp@hameemgroup.com` don't become links.
 
-The regex is intentionally conservative — a missed URL is a v0 quality note; a *wrong*
-clickable URL is worse. We keep raw OCR text available in `raw_output` for debugging misses.
+**Known limitation:** fuzzy recovers the **host + port reliably**, but the **path can still
+carry OCR letter errors** (`erp/internal` → `erpfinternal`) that aren't recoverable without a
+dictionary. The raw OCR strings are kept in `raw_output.url_candidates` as ground truth so a
+human can verify/repair a path. A missed URL is a quality note; a *wrong* clickable host is
+worse, hence the strong-signal gate.
 
 ## Modal deployment
 
