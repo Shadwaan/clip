@@ -55,8 +55,17 @@ OCR_LANGS = ["en"]          # v0: English only
 # duration, and (b) DOWNSCALE wide frames before OCR. Both are tunable: raise
 # MAX_FRAMES / DOWNSCALE_WIDTH if on-screen URLs are being missed; lower for speed.
 MAX_FRAMES = 300            # hard cap on frames OCR'd per video (effective fps = MAX_FRAMES/duration, capped at SAMPLE_FPS)
-DOWNSCALE_WIDTH = 1280      # cap frame width (px) before OCR; 0 disables downscaling
+DOWNSCALE_WIDTH = 0         # downscale width (px) before OCR; 0 = OFF. 1280 was too aggressive
+                            # for high-DPI small-text sources — a 2560px meeting recording lost
+                            # its chat URL after the 2x shrink. MAX_FRAMES is the main speed lever,
+                            # so we keep full resolution for URL legibility (recall > a bit of speed).
 OCR_PROGRESS_EVERY = 25     # heartbeat: log "frame N/total" every N frames
+
+# Diagnostic: surface raw URL-ish OCR text even when the regex rejects it, so we can
+# tell "reader didn't see the URL" (resolution) from "reader garbled it" (regex). Cheap
+# to keep on; it only collects strings that already look link-ish.
+OCR_DEBUG_CANDIDATES = True
+_CANDIDATE_TOKENS = ("http", "://", "www.", ".com", ".live", ".net", ".org", ".io", "meet", "teams")
 
 # --- Container image ---
 # ffmpeg for frame extraction; easyocr pulls its own torch/opencv/numpy stack.
@@ -197,6 +206,8 @@ class OCRModel:
         frame_dir = tempfile.mkdtemp(prefix="ocr_frames_")
         # clusters: canonical_url -> {"url", "first_seen", "last_seen", "occurrences"}
         clusters: dict[str, dict] = {}
+        # Diagnostic: raw OCR strings that look link-ish but may not pass the regex.
+        url_candidates: list[dict] = []
         frames_processed = 0
 
         try:
@@ -268,6 +279,18 @@ class OCRModel:
                     continue
 
                 blob = " ".join(texts)
+
+                # Diagnostic: capture any individual OCR string that looks link-ish,
+                # even if the regex below rejects it. Lets us distinguish "didn't read
+                # the URL" from "read it garbled/fragmented".
+                if OCR_DEBUG_CANDIDATES:
+                    for s in texts:
+                        low = s.lower()
+                        if any(tok in low for tok in _CANDIDATE_TOKENS):
+                            print(f"[modal_ocr] url-ish @ {timestamp:.1f}s: {s!r}")
+                            if len(url_candidates) < 100:
+                                url_candidates.append({"t": round(timestamp, 1), "text": s})
+
                 # Unique canonical URLs in THIS frame (so multiple hits in one
                 # frame count as a single occurrence).
                 seen_in_frame = {canonicalize(m) for m in url_re.findall(blob)}
@@ -285,8 +308,13 @@ class OCRModel:
                         entry["occurrences"] += 1
 
             links = sorted(clusters.values(), key=lambda e: e["first_seen"])
-            print(f"[modal_ocr] Found {len(links)} unique URL(s)")
-            return {"links": links, "frames_processed": frames_processed}
+            print(f"[modal_ocr] Found {len(links)} unique URL(s); "
+                  f"{len(url_candidates)} url-ish OCR string(s) captured")
+            return {
+                "links": links,
+                "frames_processed": frames_processed,
+                "url_candidates": url_candidates,
+            }
         finally:
             # Clean up the tempfile + all extracted frames.
             try:
