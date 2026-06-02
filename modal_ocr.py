@@ -75,6 +75,50 @@ OCR_DEBUG_CANDIDATES = True
 _CANDIDATE_TOKENS = ("http", "://", "www.", ".com", ".live", ".net", ".org", ".io", "meet", "teams")
 
 
+# --- OCR character-substitution post-correction --------------------------------
+# OCR (EasyOCR especially) mis-reads narrow / ambiguous glyphs in dense URL paths.
+# Validated 2026-06-02 against the EasyOCR baseline (links_meeting_771436c4.txt):
+# the rules below fix every observed mangle while leaving correct URLs, path
+# hyphens, hash values, and prose untouched. Applied per OCR string BEFORE URL
+# parsing. Each rule is tightly constrained — under-correct rather than mangle
+# (see the no-regression note on '&'→'8' below). NOTE: PaddleOCR's output is clean
+# enough that these rarely fire (0 hits on the meeting A/B) — kept as a safety net.
+_URLISH = re.compile(
+    r"(?i)(https?\s*[:/]"
+    # space-mangled host: a TLD word, then port digits, then a slash
+    r"|\b(?:com|net|org|gov|edu|live|io|bd|co)\b\s*[.\s:]*\d{2,5}\s*/"
+    r"|\.(?:com|net|org|gov|edu|live|io|bd|co)\b)"
+)
+
+
+def _postcorrect(text: str) -> str:
+    """Repair OCR character substitutions inside URL-shaped strings only."""
+    if not _URLISH.search(text):
+        return text
+    t = text
+    # NOTE: the '&' -> '8' substitution is deliberately NOT corrected. A real
+    # trailing digit '8' before a param ("70028&p3309_id") is indistinguishable
+    # from a substituted '&' ("7002&..."), so reversing it corrupts genuine
+    # values. Backed out per the no-regression rule — under-correct, don't mangle.
+    #
+    # (1) '=' read as '-' in query params: "&session-123" -> "&session=123",
+    #     "?p3309_loi_id-70028" -> "...=70028". Fires only when a '?'/'&'-led
+    #     param token is followed by '-' then a DIGIT — so it never touches path
+    #     hyphens ("purchase-requisition") or hash hyphens ("cs=3viHxGZn-ZfEmV",
+    #     where '-' precedes a letter).
+    t = re.sub(r"([?&][A-Za-z0-9_]+)-(?=\d)", r"\1=", t)
+    # (2) '/' read as 'l'/'f' right after the ERP/APEX path keyword "erp":
+    #     "erplinternal"/"erpfinternal" -> "erp/internal", "erpllogin" ->
+    #     "erp/login". Can't fire on a clean "erp/..." (no l/f there) nor on the
+    #     host "erpdev" ('d' isn't l/f).
+    t = re.sub(r"(?i)\berp([lf])(?=[a-z])", "erp/", t)
+    # (3) '/' read as 'l' in the two observed APEX route prefixes:
+    #     "dev/r" -> "devlr", "ords/r/" -> "ords/rl".
+    t = re.sub(r"(?i)\bdevlr(?=[/a-z])", "dev/r", t)
+    t = re.sub(r"(?i)\bords/rl(?=[a-z])", "ords/r/", t)
+    return t
+
+
 # --- Container image ---
 # Build on PaddlePaddle's OFFICIAL GPU image: paddle 2.6.2 + CUDA + cuDNN are
 # pre-installed and matched, with the loader paths configured so cuDNN actually
@@ -370,16 +414,22 @@ class OCRModel:
                 # fuzzy matcher can't span unrelated text boxes.
                 seen_in_frame = set()
                 for s in texts:
-                    seen_in_frame |= urls_in_text(s)
+                    corrected = _postcorrect(s)
+                    seen_in_frame |= urls_in_text(corrected)
 
-                    # Diagnostic: capture any link-ish OCR string even if
-                    # extraction rejected it.
+                    # Diagnostic: capture any link-ish OCR string (raw + corrected
+                    # when they differ). Lets us A/B raw vs corrected and tell
+                    # "didn't see the URL" from "read it garbled".
                     if OCR_DEBUG_CANDIDATES:
                         low = s.lower()
                         if any(tok in low for tok in _CANDIDATE_TOKENS):
-                            print(f"[modal_ocr] url-ish @ {timestamp:.1f}s: {s!r}")
+                            note = f" -> {corrected!r}" if corrected != s else ""
+                            print(f"[modal_ocr] url-ish @ {timestamp:.1f}s: {s!r}{note}")
                             if len(url_candidates) < 120:
-                                url_candidates.append({"t": round(timestamp, 1), "text": s})
+                                entry = {"t": round(timestamp, 1), "text": s}
+                                if corrected != s:
+                                    entry["corrected"] = corrected
+                                url_candidates.append(entry)
                 for url in seen_in_frame:
                     entry = clusters.get(url)
                     if entry is None:
