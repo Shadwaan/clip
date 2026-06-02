@@ -27,11 +27,17 @@ imageio>=2.36.0
 imageio-ffmpeg>=0.5.1
 
 # On-screen URL OCR (clip-ocr Modal app — modal_ocr.py).
-# easyocr is baked into the clip-ocr Modal image and runs ONLY inside that
-# container (the gateway never imports it). Listed here for visibility / so a
-# future local OCR backend can `pip install -r`. Not required to run the
-# gateway or to deploy clip-marlin. Pulls its own torch/opencv/numpy stack.
-easyocr>=1.7.0
+# Switched EasyOCR -> PaddleOCR 2026-06-02 (better on dense screen-text paths).
+# These are baked into the clip-ocr Modal image and run ONLY inside that
+# container (the gateway never imports them). Listed here for visibility. The
+# Modal image builds on PaddlePaddle's OFFICIAL GPU image (paddle+CUDA+cuDNN
+# pre-matched) rather than pip-installing paddlepaddle-gpu onto a bare CUDA base
+# — see modal_ocr.py's image definition. Not required to run the gateway locally
+# or to deploy clip-marlin.
+#   base image: paddlepaddle/paddle:2.6.2-gpu-cuda11.7-cudnn8.4-trt8.4
+#   paddleocr==2.7.3
+#   numpy<2                   (paddle 2.6 is built against the NumPy 1.x ABI)
+paddleocr==2.7.3
 
 # Async job queue (milestone 1) — using Modal's native FunctionCall.spawn / from_id
 # rather than Celery. Redis is still here for metadata + job-record storage

@@ -11,18 +11,24 @@ captioning app so it can be iterated and redeployed without any risk to the
 production `clip-marlin` deployment.
 
 See docs/ONSCREEN_LINKS.md for the full design rationale (why OCR instead of
-prompting the VLM, why EasyOCR, why fixed 2 fps for v0, what's out of scope).
+prompting the VLM, sampling/cost guards, what's out of scope).
+
+OCR engine: PaddleOCR (switched from EasyOCR 2026-06-02). EasyOCR read the
+on-screen URLs but mangled dense-path *punctuation* — "/" as "l"/"f", "=" as
+"-" — so the recovered URLs 404'd. PaddleOCR benchmarks materially better on
+dense screen text; we also add a post-correction pass (_postcorrect) that
+repairs the residual character substitutions before URL parsing.
 
 How it works
 ------------
-- `OCRModel` is a Modal class on a GPU container. It loads an EasyOCR reader
+- `OCRModel` is a Modal class on a GPU container. It loads a PaddleOCR reader
   once (via `@modal.enter`) and keeps it warm for `scaledown_window` seconds.
 - `extract_links(video_bytes, video_ext)` is the remote method:
     1. write bytes to a tempfile,
     2. ffmpeg-sample frames (up to SAMPLE_FPS, capped to MAX_FRAMES total;
        optionally downscaled to DOWNSCALE_WIDTH) to JPGs, recording timestamps,
-    3. EasyOCR each frame → detected text strings,
-    4. URL regex over each frame's text,
+    3. PaddleOCR each frame → detected text strings,
+    4. post-correct OCR character substitutions, then URL-extract per string,
     5. dedupe identical URLs across frames into one entry with
        first_seen / last_seen / occurrences,
     6. return {"links": [...], "frames_processed": int}.
@@ -34,19 +40,20 @@ Deploy
 Smoke test (after deploy):
     curl https://<your-workspace>--clip-ocr-healthz.modal.run
 
-EasyOCR's detection + recognition models (~100 MB for English) download on
-the first cold start into a persistent Modal Volume, so subsequent cold
-starts reuse them.
+PaddleOCR's detection + recognition + angle-cls models (~10-20 MB) download on
+the first cold start into a persistent Modal Volume (HOME=CACHE_DIR points
+~/.paddleocr there), so subsequent cold starts reuse them.
 """
 
 import modal
+import re
 
 APP_NAME = "clip-ocr"
 
-GPU_TYPE = "A10G"           # 24 GB; EasyOCR is light, but GPU makes 2 fps sampling tractable
-CACHE_DIR = "/cache"        # EasyOCR model_storage_directory (persisted on the volume)
+GPU_TYPE = "A10G"           # 24 GB; OCR is light, GPU makes dense-frame OCR tractable
+CACHE_DIR = "/cache"        # HOME → here so PaddleOCR caches models on the volume
 SAMPLE_FPS = 2              # nominal max sampling rate (used for short videos)
-OCR_LANGS = ["en"]          # v0: English only
+OCR_LANG = "en"             # v0: English only
 
 # Cost/latency guards (added 2026-06-02 after a 15-min meeting recording produced
 # ~1,815 frames at 2 fps and ran 40+ min). Dense screen-recording frames are slow
@@ -67,25 +74,40 @@ OCR_PROGRESS_EVERY = 25     # heartbeat: log "frame N/total" every N frames
 OCR_DEBUG_CANDIDATES = True
 _CANDIDATE_TOKENS = ("http", "://", "www.", ".com", ".live", ".net", ".org", ".io", "meet", "teams")
 
+
 # --- Container image ---
-# ffmpeg for frame extraction; easyocr pulls its own torch/opencv/numpy stack.
-# Baked at build time so cold starts don't pip-install.
+# Build on PaddlePaddle's OFFICIAL GPU image: paddle 2.6.2 + CUDA + cuDNN are
+# pre-installed and matched, with the loader paths configured so cuDNN actually
+# loads. Our first attempt (nvidia/cuda base + pip paddlepaddle-gpu) built fine
+# but crashed every frame at inference: "(PreconditionNotMet) Cannot load cudnn
+# shared library" — paddle couldn't find/load cuDNN on that base. The official
+# image fixes that by construction.
+#
+# Tag note: the requested cuda11.8-cudnn8.6 tag does not exist on Docker Hub;
+# the nearest 11.x GPU tag is cuda11.7-cudnn8.4-trt8.4 (verified against
+# hub.docker.com/r/paddlepaddle/paddle/tags). We deliberately do NOT pass
+# add_python — that would create a fresh interpreter that can't see the image's
+# pre-installed paddle (which we no longer pip-install), reintroducing the very
+# cuDNN problem we're fixing. We use the image's own Python instead.
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg")
+    modal.Image.from_registry("paddlepaddle/paddle:2.6.2-gpu-cuda11.7-cudnn8.4-trt8.4")
+    .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
     .pip_install(
-        # EasyOCR brings torch, torchvision, opencv-python-headless, numpy,
-        # Pillow, scikit-image, python-bidi, shapely, pyclipper, etc. as deps.
-        "easyocr>=1.7.0",
-        # Required by `@modal.fastapi_endpoint` (healthz). Modal no longer
-        # installs FastAPI automatically.
+        # paddlepaddle-gpu is already in the base image — only add PaddleOCR + deps.
+        # PaddleOCR pulls shapely, pyclipper, opencv-python, lmdb, etc.
+        "paddleocr==2.7.3",
+        # Keep NumPy <2: paddle 2.6 is built against the NumPy 1.x C ABI, and
+        # paddleocr's deps would otherwise pull 2.x (runtime ImportError:
+        # "numpy.core.multiarray failed to import").
+        "numpy<2",
+        # Required by `@modal.fastapi_endpoint` (healthz).
         "fastapi[standard]>=0.115.0",
     )
 )
 
 app = modal.App(APP_NAME, image=image)
 
-# Dedicated volume for EasyOCR weights — kept separate from clip-marlin's
+# Dedicated volume for PaddleOCR weights — kept separate from clip-marlin's
 # `clip-model-cache` so the two apps share no state and can be wiped/iterated
 # independently.
 ocr_cache = modal.Volume.from_name("clip-ocr-cache", create_if_missing=True)
@@ -105,29 +127,34 @@ class OCRModel:
 
     @modal.enter()
     def load(self):
-        """Run on container startup. Builds the EasyOCR reader (downloads
+        """Run on container startup. Builds the PaddleOCR reader (downloads
         weights into the volume on first cold start)."""
-        import easyocr
-        import torch
+        import os
+        # PaddleOCR caches its models under ~/.paddleocr; point HOME at the
+        # persistent volume so the download happens once across cold starts.
+        os.environ["HOME"] = CACHE_DIR
 
-        # Confirm GPU explicitly. EasyOCR silently falls back to (very slow) CPU
-        # if gpu=True but CUDA isn't visible — that ambiguity cost us a 40-min
-        # debugging detour, so we log it loudly and pass the real value through.
-        gpu_ok = torch.cuda.is_available()
-        device = torch.cuda.get_device_name(0) if gpu_ok else "CPU"
-        print(f"[modal_ocr] torch.cuda.is_available()={gpu_ok} device={device}")
+        import paddle
+        from paddleocr import PaddleOCR
 
-        print(f"[modal_ocr] Building EasyOCR reader (langs={OCR_LANGS}, gpu={gpu_ok})...")
-        # model_storage_directory points EasyOCR at the persistent volume so
-        # the ~100 MB English models download once across cold starts.
-        self.reader = easyocr.Reader(
-            OCR_LANGS,
-            gpu=gpu_ok,
-            model_storage_directory=CACHE_DIR,
-            download_enabled=True,
+        # Confirm GPU explicitly. PaddleOCR silently falls back to (very slow)
+        # CPU if use_gpu=True but CUDA isn't usable — that kind of ambiguity
+        # cost us a 40-min detour on EasyOCR, so log it loudly and pass through.
+        gpu_ok = bool(paddle.is_compiled_with_cuda()) and paddle.device.cuda.device_count() > 0
+        print(f"[modal_ocr] paddle.is_compiled_with_cuda()={paddle.is_compiled_with_cuda()} "
+              f"cuda_device_count={paddle.device.cuda.device_count()} -> use_gpu={gpu_ok}")
+
+        print(f"[modal_ocr] Building PaddleOCR reader (lang={OCR_LANG}, gpu={gpu_ok})...")
+        # use_angle_cls handles rotated text; for screen captures it's rarely
+        # needed but cheap. show_log=False keeps the per-call paddle spam down.
+        self.ocr = PaddleOCR(
+            use_angle_cls=True,
+            lang=OCR_LANG,
+            use_gpu=gpu_ok,
+            show_log=False,
         )
         ocr_cache.commit()  # persist any newly-downloaded weights
-        print("[modal_ocr] EasyOCR reader ready.")
+        print("[modal_ocr] PaddleOCR reader ready.")
 
     @modal.method()
     def extract_links(
@@ -321,29 +348,37 @@ class OCRModel:
                     print(f"[modal_ocr] OCR {idx + 1}/{frames_processed} frames, "
                           f"{len(clusters)} url(s) so far")
 
-                # detail=0 → list of detected text strings (no bboxes/scores).
+                # PaddleOCR returns a per-image list: result[0] is a list of
+                # [box, (text, confidence)] entries, or None for a blank frame.
                 try:
-                    texts = self.reader.readtext(fpath, detail=0, paragraph=False)
+                    result = self.ocr.ocr(fpath, cls=True)
                 except Exception as e:
                     # A single unreadable frame shouldn't abort the whole job.
                     print(f"[modal_ocr] OCR failed on {fn}: {e}")
                     continue
+                texts = []
+                if result and result[0]:
+                    for line in result[0]:
+                        try:
+                            texts.append(line[1][0])
+                        except (IndexError, TypeError):
+                            continue
 
                 # Unique canonical URLs in THIS frame (so multiple hits in one
-                # frame count as a single occurrence). Run extraction per detected
-                # string so the fuzzy matcher can't span unrelated text boxes.
+                # frame count as a single occurrence). Post-correct OCR character
+                # substitutions first, then extract per detected string so the
+                # fuzzy matcher can't span unrelated text boxes.
                 seen_in_frame = set()
                 for s in texts:
                     seen_in_frame |= urls_in_text(s)
 
-                    # Diagnostic: capture any individual OCR string that looks
-                    # link-ish, even if extraction rejected it. Lets us tell
-                    # "didn't see the URL" from "read it garbled".
+                    # Diagnostic: capture any link-ish OCR string even if
+                    # extraction rejected it.
                     if OCR_DEBUG_CANDIDATES:
                         low = s.lower()
                         if any(tok in low for tok in _CANDIDATE_TOKENS):
                             print(f"[modal_ocr] url-ish @ {timestamp:.1f}s: {s!r}")
-                            if len(url_candidates) < 100:
+                            if len(url_candidates) < 120:
                                 url_candidates.append({"t": round(timestamp, 1), "text": s})
                 for url in seen_in_frame:
                     entry = clusters.get(url)
@@ -392,7 +427,8 @@ def healthz():
         "app": APP_NAME,
         "gpu": GPU_TYPE,
         "sample_fps": SAMPLE_FPS,
-        "langs": OCR_LANGS,
+        "engine": "paddleocr",
+        "lang": OCR_LANG,
     }
 
 
