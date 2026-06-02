@@ -26,6 +26,13 @@ opencv-python>=4.10.0
 imageio>=2.36.0
 imageio-ffmpeg>=0.5.1
 
+# On-screen URL OCR (clip-ocr Modal app — modal_ocr.py).
+# easyocr is baked into the clip-ocr Modal image and runs ONLY inside that
+# container (the gateway never imports it). Listed here for visibility / so a
+# future local OCR backend can `pip install -r`. Not required to run the
+# gateway or to deploy clip-marlin. Pulls its own torch/opencv/numpy stack.
+easyocr>=1.7.0
+
 # Async job queue (milestone 1) — using Modal's native FunctionCall.spawn / from_id
 # rather than Celery. Redis is still here for metadata + job-record storage
 # (see store.py); we just don't run a separate worker process.
