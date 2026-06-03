@@ -48,6 +48,10 @@ the first cold start into a persistent Modal Volume (HOME=CACHE_DIR points
 import modal
 import re
 
+# Shared helper: writes video_bytes OR a downloaded video_url to a tempfile.
+# Added to the image below via .add_local_python_source. Bytes path unchanged.
+from video_source import _materialize_video
+
 APP_NAME = "clip-ocr"
 
 GPU_TYPE = "A10G"           # 24 GB; OCR is light, GPU makes dense-frame OCR tractable
@@ -147,6 +151,8 @@ image = (
         # Required by `@modal.fastapi_endpoint` (healthz).
         "fastapi[standard]>=0.115.0",
     )
+    # Ship the shared video-input helper so the container can import it.
+    .add_local_python_source("video_source")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -203,11 +209,17 @@ class OCRModel:
     @modal.method()
     def extract_links(
         self,
-        video_bytes: bytes,
+        video_bytes: bytes | None = None,
         video_ext: str = "mp4",
+        *,
+        video_url: str | None = None,
     ) -> dict:
         """
         Extract on-screen URLs with timestamps from a video.
+
+        Accepts the video as `video_bytes` (existing path, unchanged) OR a new
+        keyword-only `video_url` stream-downloaded in the container. Provide
+        exactly one. See video_source._materialize_video.
 
         Returns:
             {
@@ -318,12 +330,10 @@ class OCRModel:
                 found.add(canonicalize(url))
             return found
 
-        # ---- write bytes to disk for ffmpeg --------------------------------
-        with tempfile.NamedTemporaryFile(
-            suffix=f".{video_ext}", delete=False
-        ) as f:
-            f.write(video_bytes)
-            video_path = f.name
+        # ---- materialize video (bytes or downloaded URL) for ffmpeg --------
+        video_path = _materialize_video(
+            video_bytes=video_bytes, video_url=video_url, video_ext=video_ext
+        )
 
         frame_dir = tempfile.mkdtemp(prefix="ocr_frames_")
         # clusters: canonical_url -> {"url", "first_seen", "last_seen", "occurrences"}

@@ -35,6 +35,11 @@ Subsequent cold starts reuse those weights, so they're much faster.
 
 import modal
 
+# Shared helper: writes video_bytes OR a downloaded video_url to a tempfile.
+# Added to each image below via .add_local_python_source so it's importable in
+# the container. The bytes path is unchanged; video_url is additive.
+from video_source import _materialize_video
+
 APP_NAME = "clip-marlin"
 MODEL_REPO = "NemoStation/Marlin-2B"
 
@@ -93,6 +98,8 @@ image = (
         # install FastAPI automatically but no longer does.
         "fastapi[standard]>=0.115.0",
     )
+    # Ship the shared video-input helper so the container can import it.
+    .add_local_python_source("video_source")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -137,6 +144,8 @@ qwen_image = (
         "huggingface_hub>=0.26.0",
         "fastapi[standard]>=0.115.0",
     )
+    # Ship the shared video-input helper so the container can import it.
+    .add_local_python_source("video_source")
 )
 
 # Persistent volume for model weights. First run pulls ~5 GB; subsequent
@@ -252,12 +261,18 @@ class MarlinModel:
     @modal.method()
     def caption(
         self,
-        video_bytes: bytes,
+        video_bytes: bytes | None = None,
         video_ext: str = "mp4",
         max_new_tokens: int = 2048,
+        *,
+        video_url: str | None = None,
     ) -> dict:
         """
         Run Marlin's native .caption() method on a video file.
+
+        Accepts the video as `video_bytes` (existing path, unchanged) OR a new
+        keyword-only `video_url` that is stream-downloaded in the container.
+        Provide exactly one. See video_source._materialize_video.
 
         This is the canonical inference pathway per the Marlin model card:
         Marlin's custom modeling code (loaded via trust_remote_code=True)
@@ -316,14 +331,13 @@ class MarlinModel:
                 out_lines.append(tag_re.sub(new_tag, line, count=1))
             return "\n".join(out_lines)
 
-        # Marlin's internal decoder needs a real file on disk. Write the
-        # incoming bytes to a tempfile in the container's filesystem,
-        # then clean up after the call regardless of success/failure.
-        with tempfile.NamedTemporaryFile(
-            suffix=f".{video_ext}", delete=False
-        ) as f:
-            f.write(video_bytes)
-            video_path = f.name
+        # Marlin's internal decoder needs a real file on disk. Materialize the
+        # video (from bytes or a downloaded URL) to a tempfile, then clean up
+        # after the call regardless of success/failure. The chunking path below
+        # still uses tempfile for its per-window segments.
+        video_path = _materialize_video(
+            video_bytes=video_bytes, video_url=video_url, video_ext=video_ext
+        )
 
         segments: list[str] = []
         try:
@@ -397,13 +411,20 @@ class MarlinModel:
     @modal.method()
     def find(
         self,
-        video_bytes: bytes,
-        event: str,
+        video_bytes: bytes | None = None,
+        event: str | None = None,
         video_ext: str = "mp4",
+        *,
+        video_url: str | None = None,
     ) -> dict:
         """
         Run Marlin's native .find() method to temporally ground a
         natural-language event query inside the video.
+
+        Accepts `video_bytes` (existing path, unchanged) OR keyword-only
+        `video_url` (downloaded in-container). `event` keeps its positional
+        slot but now defaults to None so video_bytes can default to None too;
+        it is still required and validated at runtime.
 
         Like caption(), this is the canonical pathway per the Marlin
         model card. Marlin has a separately-trained "find" mode that
@@ -415,13 +436,12 @@ class MarlinModel:
         Returns {"raw": str, "span": (s, e) | None, "format_ok": bool}.
         """
         import os
-        import tempfile
 
-        with tempfile.NamedTemporaryFile(
-            suffix=f".{video_ext}", delete=False
-        ) as f:
-            f.write(video_bytes)
-            video_path = f.name
+        if event is None:
+            raise ValueError("find() requires an 'event' query string.")
+        video_path = _materialize_video(
+            video_bytes=video_bytes, video_url=video_url, video_ext=video_ext
+        )
 
         try:
             result = self.model.find(video_path, event=event)
@@ -565,8 +585,8 @@ class QwenVL:
     @modal.method()
     def ask(
         self,
-        video_bytes: bytes,
-        question: str,
+        video_bytes: bytes | None = None,
+        question: str | None = None,
         video_ext: str = "mp4",
         max_new_tokens: int = 512,
         # num_frames caps the video-token cost. 32 keeps us comfortably
@@ -574,6 +594,8 @@ class QwenVL:
         # warns to mind GPU memory budget on long video. fps=None makes
         # num_frames authoritative (per the README "Pixel Control" example).
         num_frames: int = 32,
+        *,
+        video_url: str | None = None,
     ) -> dict:
         """
         Run open-ended Q&A against the video.
@@ -593,14 +615,13 @@ class QwenVL:
         Returns {"raw": str} — the model's answer text.
         """
         import os
-        import tempfile
         import torch
 
-        with tempfile.NamedTemporaryFile(
-            suffix=f".{video_ext}", delete=False
-        ) as f:
-            f.write(video_bytes)
-            video_path = f.name
+        if question is None:
+            raise ValueError("ask() requires a 'question' string.")
+        video_path = _materialize_video(
+            video_bytes=video_bytes, video_url=video_url, video_ext=video_ext
+        )
 
         try:
             messages = [
